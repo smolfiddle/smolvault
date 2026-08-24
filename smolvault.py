@@ -75,7 +75,7 @@ import zlib
 from collections import Counter, namedtuple
 from socketserver import ThreadingMixIn
 
-__version__ = "0.2.5"
+__version__ = "0.3.0"
 
 log = logging.getLogger("smolvault")
 

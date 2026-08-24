@@ -68,7 +68,7 @@ phone and the same library streams there.
 
 ```
   ┌────────────────────────────────────────────────────────┐
-    smolvault 0.2.1
+    smolvault 0.3.0
     vault    vault.vault · 12 files · 22.3 GB logical · 11 GB stored
     local    http://127.0.0.1:8100/
     network  http://192.168.1.14:8100/   ● running   ← phone/TV ready
@@ -271,7 +271,7 @@ Loopback · NVMe · 6 cores ([full sheet](BENCHMARKS.md), reproduce with
 | Dedup | identical content → **+0 bytes**; WORM reject < 1 ms |
 | Full read 700 MB | **~150 MB/s** hash-verified |
 | Concurrent reads | **230–533 MB/s** aggregate |
-| Range read p50/p95 | **~5 ms / 12 ms** (256 KB, keep-alive) |
+| Range read p50/p95 | **~5–8 ms / 12–17 ms** (256 KB, keep-alive) |
 | Playback vs local disk | startup ≈+0.2 s · deep seek ≈+0.0–0.1 s |
 | Vault sync | push @ **13–17 MB/s** · no-op re-sync **< 20 ms** |
 
@@ -309,6 +309,7 @@ Every promise the docs make, measured ([full sheet](BENCHMARKS.md)):
 | **Write endurance** — 2.8 GB sustained in 45 s | 62 MB/s mean · commit latency *improved* over time (524→480 ms p50) · WAL capped at 32 MB |
 | **At-rest encryption cost** — AES-256-GCM on/off | seals ≈15–25% slower · reads within ~20% · range seeks unaffected (~6–8 ms p50) · unlock ~85 ms |
 | **Message board** — post → readable | ~22 ms roundtrip |
+| **Remote ingest** — `--share-root`, 2 paths via one POST | sealed server-side in ~2 ms · traversal attempts → `403` · re-ingest → `409` |
 
 The WORM race test earned its keep: it exposed a real bug (losing writers
 stalled 60 s on SQLite lock timeouts, then died without a response) which is
