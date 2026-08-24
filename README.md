@@ -104,7 +104,7 @@ After each action the hub collapses to a one-line prompt —
   `Cache-Control: immutable`. Players seek as if the file were local.
 - **Content-defined chunking** — gear-hash CDC (64 KB–1 MB chunks) makes dedup
   work across shifted/ressembled files, not just identical copies: a mid-file
-  edit still dedups ~90%+ on re-seal.
+  edit still dedups roughly half or more of the file on re-seal (up to ~98%).
 - **Entropy-adaptive storage** — high-entropy media stored raw and scanned on
   a coarse fast stride (~2× seal speed); compressible text is compressed.
 - **Folder-aware ingest** — recursive walks keep structure
@@ -299,7 +299,7 @@ Every promise the docs make, measured ([full sheet](BENCHMARKS.md)):
 
 | Promise | Measured |
 |---|---|
-| **CDC survives edits** — insert 1 MB mid-file into 192 MB, re-seal | **62–98% deduped** (varies with edit position) · effective write speed still *exceeds* naive copy |
+| **CDC survives edits** — insert 1 MB mid-file into 192 MB, re-seal | **≈50–98% deduped** (varies with edit position/content) · effective write speed still *exceeds* naive copy |
 | **Small-file reality** — 1500 mixed 0–64 KB files | **~370 files/s** · seal p50 ~1 ms |
 | **Library scale** — 10k / 50k entries | `--list` 19 / 113 ms · search 25 / 139 ms · `du` 6 / 33 ms |
 | **Reads don't block on writes** — 6 range-readers during a 256 MB PUT | 1991 reads · p50 **29 ms** / p95 78 ms while writer ran at 22 MB/s |
