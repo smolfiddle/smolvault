@@ -20,7 +20,8 @@ integrity.
 
 Highlights
 ----------
-- Wizard hub:  add / search / watch / list / info / export / verify
+- Wizard hub:  add / search / watch / library / du / board / info /
+  export / sync / verify
 - `--play QUERY` finds a file and launches mpv against it automatically
 - Drag & drop ingest: drop files into the terminal at the `add` prompt
 - Folder ingest: point add at a directory — structure preserved, or
@@ -51,6 +52,7 @@ import bisect
 import getpass
 import glob
 import hashlib
+import html
 import hmac
 import http.server
 import json
@@ -73,7 +75,7 @@ import zlib
 from collections import Counter, namedtuple
 from socketserver import ThreadingMixIn
 
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 
 log = logging.getLogger("smolvault")
 
@@ -134,7 +136,7 @@ def setup_logging(verbose):
 
 
 # ---------------------------------------------------------------------------
-# Content-defined chunker (gear-hash rolling window, stride 32)
+# Content-defined chunker (gear-hash rolling window, entropy-picked stride)
 # ---------------------------------------------------------------------------
 
 class Chunker:
@@ -763,11 +765,6 @@ class Store:
             out.append(d)
         return out
 
-    def msg_last_id(self):
-        r = self.conn().execute(
-            "SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()
-        return r[0]
-
     # ---- write ---------------------------------------------------------------
 
     def _flush_chunks(self, conn, batch, new_stored):
@@ -1146,8 +1143,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ---- methods ---------------------------------------------------------------
 
     def do_OPTIONS(self):
-        self._head(200, 0, extra={"Allow": "OPTIONS, GET, HEAD, PUT",
-                                  "Accept-Ranges": "bytes", "DAV": "1"})
+        self._head(200, 0, extra={
+            "Allow": "OPTIONS, GET, HEAD, POST, PUT, DELETE",
+            "Accept-Ranges": "bytes"})
         self.end_headers()
 
     def do_PUT(self):
@@ -1293,8 +1291,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _api_msg(self):
         """Board read: /__api/msg?since=N&limit=M"""
         q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        since = int(q.get("since", ["0"])[0] or 0)
-        limit = int(q.get("limit", ["100"])[0] or 100)
+        try:
+            since = int(q.get("since", ["0"])[0] or 0)
+            limit = int(q.get("limit", ["100"])[0] or 100)
+        except ValueError:
+            self._head(400, 0); self.end_headers(); return
         rows = self.store.msgs_since(since, limit)
         payload = json.dumps({
             "messages": [{"id": r["id"], "ts": r["ts"], "sender": r["sender"],
@@ -1339,15 +1340,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         prefix = _norm(self.path).rstrip("/") + "/"
         dirs, files = self.store.list_dir(prefix)
         base = prefix.rstrip("/")
-        items = [f'<a href="{urllib.parse.quote(base + "/" + d)}/">{d}/</a>'
+        esc = html.escape
+        items = [f'<a href="{urllib.parse.quote(base + "/" + d)}/">{esc(d)}/</a>'
                  for d in dirs]
         for f in files:
             name = f["path"].rsplit("/", 1)[-1]
             items.append(
-                f'<a href="{urllib.parse.quote(base + "/" + name)}">{name}</a>'
+                f'<a href="{urllib.parse.quote(base + "/" + name)}">{esc(name)}</a>'
                 f' <small>({fmt(f["size"])})</small>')
         body = ("<html><head><title>%s</title></head><body><h2>%s</h2><ul>%s</ul>"
-                "</body></html>" % (prefix or "/", prefix or "/",
+                "</body></html>" % (esc(prefix or "/"), esc(prefix or "/"),
                                     "".join(f"<li>{i}</li>" for i in items)))
         payload = body.encode()
         self._head(200, len(payload), None, "text/html; charset=utf-8")
@@ -1558,7 +1560,8 @@ def gather_add_selections(paths, asker, interactive, force_pick=False):
 
     Files stay loose (dest name None → caller picks basename). Folders walk
     via collect_files keeping relative structure; interactively each folder
-    offers [Enter]=whole vs [b]=browse&pick. Returns (items, suggested_into).
+    offers [Enter]=whole vs [b]=browse&pick (force_pick skips the question).
+    Returns (items, suggested_into).
     """
     items, suggest = [], ""
     for src in paths:
@@ -1684,7 +1687,11 @@ def add_files(store, src_paths, into="/"):
 
 
 def vault_stats_line(s):
-    dedup = (100 - s["stored"] / s["logical"] * 100) if s["logical"] else 0
+    if not s.get("stored"):
+        tail = "" if s.get("stored") else " (remote: stored n/a)" \
+            if s.get("remote") else ""
+        return f"{s['files']} files · {fmt(s['logical'])} logical{tail}"
+    dedup = 100 - s["stored"] / s["logical"] * 100
     return (f"{s['files']} files · {fmt(s['logical'])} logical · "
             f"{fmt(s['stored'])} stored · {dedup:.0f}% deduped")
 
@@ -1939,10 +1946,6 @@ MPV_ANDROID_NAMES = ("mpv-android", "mpvapp")
 def _in_termux():
     return ("TERMUX_VERSION" in os.environ
             or "com.termux" in os.environ.get("PREFIX", ""))
-
-
-def resolve_player(explicit=None):
-    return explicit or os.environ.get("SMOLVAULT_PLAYER") or "mpv"
 
 
 def _clipboard_set(text):
@@ -2266,8 +2269,9 @@ def multi_pick(rows):
 
 class BrowseState:
     """Pure-logic directory navigator (no I/O beyond directory listing).
-    Selections are relpaths (posix) relative to *root*; selecting a
-    directory means its entire subtree."""
+    *root* is the navigation ceiling, *anchor* the starting dir (into-folder
+    suggestions and seal relpaths are anchor-relative). Selections are
+    absolute paths; selecting a directory means its entire subtree."""
 
     def __init__(self, root, anchor=None):
         self.root = os.path.abspath(root)          # navigation ceiling
@@ -2315,7 +2319,7 @@ class BrowseState:
 
     def entries(self):
         """Filtered, ordered visible entries:
-        [(name, is_dir, size, relpath)]."""
+        [(name, is_dir, size, abspath)]."""
         q = self.query.lower()
         out = []
         for name, is_dir, size in self._scan(self.cur):
@@ -2795,7 +2799,7 @@ def print_banner(vault, s, urls, auth_on, server_state="● running",
 
 
 WIZARD_MENU = f"""
-    {cyan('a')} add       {dim('drag & drop files here, press Enter')}
+    {cyan('a')} add       {dim('drop files · path · [b]rowse a folder')}
     {cyan('s')} search    {dim('find something')}
     {cyan('p')} play      {dim('search → mpv  (w works too)')}
     {cyan('l')} library   {dim('browse everything')}
@@ -2810,7 +2814,7 @@ WIZARD_MENU = f"""
     {cyan('q')} quit"""
 
 CLIENT_MENU = f"""
-    {cyan('a')} add       {dim('upload files to the remote vault')}
+    {cyan('a')} add       {dim('drop files · path · [b]rowse, then upload')}
     {cyan('s')} search    {dim('find something')}
     {cyan('p')} watch     {dim('remote search → player')}   {dim('(w too)')}
     {cyan('l')} library   {dim('browse everything')}
@@ -3324,21 +3328,19 @@ class RemoteVault:
         return url
 
     def store_requires_auth(self):
-        """Probe the vault once without credentials: 401 ⇒ gated."""
+        """Probe the vault once without credentials: 401 ⇒ gated.
+        Cached for the connection's lifetime."""
+        if getattr(self, "_auth_probe", None) is not None:
+            return self._auth_probe
         import http.client as hc
         try:
             conn = hc.HTTPConnection(self.host, self.port, timeout=5)
             conn.request("GET", "/__api/auth")
             r = conn.getresponse(); r.read(); conn.close()
-            return r.status == 401
+            self._auth_probe = r.status == 401
         except Exception:
-            return True                      # assume gated on uncertainty
-
-    def watch(self, path, mime, player=None):
-        if not (mime or "").startswith(("video/", "audio/", "image/")):
-            print(yellow(f"  '{path}' is {mime} — not watchable. Use [g]."))
-            return EXIT_NOMATCH
-        return play_url(self.cred_url(path), mime, player)
+            self._auth_probe = True          # assume gated on uncertainty
+        return self._auth_probe
 
     def export(self, path, out=None):
         out = out or os.path.basename(path)
@@ -3380,7 +3382,6 @@ class RemoteVault:
         quoted = urllib.parse.quote(dest)
         total = os.path.getsize(local_path)
         bar = ProgressBar(os.path.basename(dest), total)
-        sent = [0]
 
         def reader():
             with open(local_path, "rb") as f:
@@ -3388,7 +3389,6 @@ class RemoteVault:
                     b = f.read(256 * 1024)
                     if not b:
                         break
-                    sent[0] += len(b)
                     bar.update(len(b))
                     yield b
 
@@ -3974,8 +3974,6 @@ def main(argv=None):
             print(red(str(e)))
             return EXIT_NOMATCH
 
-        verb = "encrypting" if args.encrypt else "decrypting"
-        _like = ("<>", "LIKE") if args.encrypt else ("=", "NOT")
         n_all = store.conn().execute(
             "SELECT COUNT(*) FROM chunks WHERE "
             "substr(hex(data),1,10) "

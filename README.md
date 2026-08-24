@@ -3,7 +3,7 @@
 [![python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
 [![dependencies](https://img.shields.io/badge/dependencies-zero-success)](#requirements)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-![version](https://img.shields.io/badge/version-0.2.4-lightgrey)
+![version](https://img.shields.io/badge/version-0.2.5-lightgrey)
 
 **smolvault is an immutable, content-addressed vault for everything you have —
 that speaks just enough HTTP to be mistaken for a local disk.**
@@ -47,10 +47,11 @@ Press `a`, drag any files from your file manager into the terminal, Enter:
 
 Point it at a folder to ingest a whole tree — or `[b]` to open the
 **browse navigator**: a tiny file manager starting at your current
-directory (`←` climbs up). `→` descend · Space toggles (on a folder =
-its whole subtree, `◐ n/m` while partial) · `a` select-all · live
-filter · `s` seals the selection. Then press `p` and start typing —
-results filter as you type:
+directory. `↑↓` move · `→` descend · `←` climbs up · Space toggles
+(on a folder = its whole subtree, `◐ n/m` while partial) · `a`
+select-all · live filter · `s` seals the selection. Vault internals
+(`*.vault`, `__pycache__`) never appear. Then press `p` and start
+typing — results filter as you type:
 
 ```
   watch ❯ dune · 2
@@ -73,7 +74,7 @@ phone and the same library streams there.
     auth     password protected · AES-256-GCM at rest
   └────────────────────────────────────────────────────────┘
 
-    a add       drag & drop / point at a folder / browse & pick
+    a add       drop files · path · [b]rowse a folder
     s search    find something
     p play      live search → mpv        (w works too)
     l library   browse everything (paged)
