@@ -73,7 +73,7 @@ import zlib
 from collections import Counter, namedtuple
 from socketserver import ThreadingMixIn
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 log = logging.getLogger("smolvault")
 
@@ -2405,6 +2405,58 @@ class BrowseState:
         return out
 
 
+def _parse_escape(seq):
+    """Normalize an escape sequence (starting with \x1b, possibly bare)
+    into an action token. Unknown sequences -> 'ignore' so bytes never
+    leak into the filter."""
+    body = seq[1:]
+    if body == "":
+        return "esc"
+    if body in ("[A", "OA"):
+        return "up"
+    if body in ("[B", "OB"):
+        return "down"
+    if body in ("[C", "OC"):
+        return "right"
+    if body in ("[D", "OD"):
+        return "left"
+    if re.fullmatch(r"\[1;\d+[ABCD]", body):
+        return {"A": "up", "B": "down",
+                "C": "right", "D": "left"}[body[-1]]
+    if body == "[Z":
+        return "shifttab"
+    return "ignore"
+
+
+def _read_key(fd):
+    """Read one logical key in raw mode: printable char, action token
+    (up/down/right/left/esc/ignore) or None on EOF. Escape sequences are
+    drained atomically, so split deliveries and application-mode
+    (\x1bO..) or modified (\x1b[1;5..) forms all parse cleanly."""
+    import select as _sel
+    b = os.read(fd, 1)
+    if not b:
+        return None
+    c = b.decode("utf-8", "replace")
+    if c != "\x1b":
+        return c
+    seq = "\x1b"
+    while True:
+        r, _, _ = _sel.select([fd], [], [], 0.03)
+        if not r:
+            break
+        try:
+            more = os.read(fd, 32)
+        except OSError:
+            break
+        if not more:
+            break
+        seq += more.decode("utf-8", "replace")
+        if seq[-1].isalpha() or seq[-1] == "~":
+            break
+    return _parse_escape(seq)
+
+
 def _browse_render(st):
     """Frame in the live_search protocol: every line \r-prefixed and
     \x1b[K-terminated, frame ends by cursor-up so repaints stay put."""
@@ -2440,10 +2492,15 @@ def _browse_render(st):
     counts += dim(f"   {len(es)} shown")
 
     B = "─" * 66
-    lines = [line(head + counts), line(dim("  " + B))]
+    lines = ["\x1b[J" + line(head + counts), line(dim("  " + B))]
     lo = max(0, min(st.sel - 6, max(len(es) - 12, 0)))
     window = es[lo:lo + 12]
-    for i, (name, is_dir, size, r) in enumerate(window, lo):
+    window += [None] * (12 - len(window))          # constant frame height
+    for i, entry in enumerate(window, lo):
+        if entry is None:
+            lines.append(line())
+            continue
+        name, is_dir, size, r = entry
         cursor = " ❯ " if i == st.sel else "   "
         tick = green("✓") if r in st.checked else " "
         if is_dir:
@@ -2461,7 +2518,7 @@ def _browse_render(st):
             name_col = tick + " " + name
         lines.append(line(f" {cursor} {name_col:<40}{mark}"))
     lines.append(line(dim("  " + B)))
-    foot = "  → open · ← up · space ✓ · a all · u none"
+    foot = "  ↑↓ move · → open · ← up · space ✓ · a all · u none"
     foot += dim(" · s seal " + (f"✓{len(st.checked)}" if st.checked
                                 else "") + " · esc")
     lines.append(line(foot))
@@ -2500,51 +2557,43 @@ def browse_picker(start=None):
         while True:
             sys.stdout.write(_browse_render(st))
             sys.stdout.flush()
-            ch = sys.stdin.read(1)
-            n = len(st.entries())
-            if ch == "\x1b":
-                r, _, _ = select.select([sys.stdin], [], [], 0.05)
-                if r:
-                    b = sys.stdin.read(1)
-                    if b == "[":
-                        d = sys.stdin.read(1)
-                        if d == "C":
-                            st.descend()
-                        elif d == "D":
-                            st.parent()
-                        elif d == "A":
-                            st.sel = max(0, st.sel - 1)
-                        elif d == "B":
-                            st.sel = min(max(n - 1, 0), st.sel + 1)
-                    continue
-                return None                      # bare Esc cancels
-            if ch == "\x03":
+            key = _read_key(fd)
+            if key is None or key in ("esc", "\x03", "\x04"):
                 return None
-            if ch in ("\r", "\n"):
+            n = len(st.entries())
+            if key == "up":
+                st.sel = max(0, st.sel - 1)
+            elif key == "down":
+                st.sel = min(max(n - 1, 0), st.sel + 1)
+            elif key == "right":
+                st.descend()
+            elif key == "left":
+                st.parent()
+            elif key in ("\r", "\n"):
                 e = st.current()
                 if e and e[1]:
                     st.descend()
                 else:
                     st.toggle()
-            elif ch == " ":
+            elif key == " ":
                 st.toggle()
-            elif ch in ("\x7f", "\b"):
+            elif key in ("\x7f", "\b"):
                 if st.query:
                     st.query = st.query[:-1]
                     st.sel = 0
                 else:
                     st.parent()
-            elif ch == "a":
+            elif key == "a":
                 st.select_visible()
-            elif ch == "u":
+            elif key == "u":
                 st.clear()
-            elif ch == "s":
+            elif key == "s":
                 return st.confirm_items()
-            elif ch in ("\x04",):                # Ctrl+D cancels
-                return None
-            elif ch >= " ":
-                st.query += ch
+            elif len(key) == 1 and key >= " ":
+                st.query += key
                 st.sel = 0
+            # unknown multi-char tokens ("ignore"/"shifttab"): no-op
+
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         sys.stdout.write("\r\x1b[J\x1b[?25h")

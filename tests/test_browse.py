@@ -138,3 +138,63 @@ class TestWiring(BrowseTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFrameProtocol(BrowseTestBase):
+    def _frame(self, st):
+        return sv._browse_render(st)
+
+    def test_clear_below_on_first_line(self):
+        st = sv.BrowseState(self.W, anchor=self.W)
+        f = self._frame(st)
+        self.assertTrue(f.split("\n")[0].startswith("\x1b[J"))
+
+    def test_all_lines_carriage_return_led(self):
+        st = sv.BrowseState(self.W, anchor=self.W)
+        for _ in range(30):
+            open(os.path.join(self.W, f"f{_:02}.txt"), "wb").write(b"x")
+            st = sv.BrowseState(self.W, anchor=self.W)
+        f = self._frame(st)
+        for i, l in enumerate(f.split("\n")):
+            self.assertTrue(l.startswith("\r") or l.startswith("\x1b[J"),
+                            f"line {i} not CR-led: {l[:12]!r}")
+
+    def test_constant_frame_height(self):
+        st = sv.BrowseState(self.W, anchor=self.W)
+        h1 = len(self._frame(st).split("\n"))
+        for i in range(30):
+            open(os.path.join(self.W, f"g{i:02}.txt"), "wb").write(b"x")
+        h2 = len(self._frame(st).split("\n"))
+        self.assertEqual(h1, h2)
+
+    def test_single_footer_no_stale_lines(self):
+        st = sv.BrowseState(self.W, anchor=self.W)
+        f1 = self._frame(st)
+        for i in range(30):
+            open(os.path.join(self.W, f"h{i:02}.txt"), "wb").write(b"x")
+        f2 = self._frame(st)
+        for frame in (f1, f2):
+            self.assertEqual(
+                sum(1 for l in frame.split("\n") if "↑↓ move" in l), 1)
+
+
+class TestParseEscape(unittest.TestCase):
+    def test_arrows_both_encodings(self):
+        for seq, want in [("\x1b[A", "up"), ("\x1bOA", "up"),
+                          ("\x1b[B", "down"), ("\x1bOB", "down"),
+                          ("\x1b[C", "right"), ("\x1bOC", "right"),
+                          ("\x1b[D", "left"), ("\x1bOD", "left")]:
+            self.assertEqual(sv._parse_escape(seq), want, seq)
+
+    def test_modified_arrows(self):
+        self.assertEqual(sv._parse_escape("\x1b[1;5C"), "right")
+        self.assertEqual(sv._parse_escape("\x1b[1;2A"), "up")
+
+    def test_bare_esc_and_unknown(self):
+        self.assertEqual(sv._parse_escape("\x1b"), "esc")
+        self.assertEqual(sv._parse_escape("\x1b[999~"), "ignore")
+        self.assertEqual(sv._parse_escape("\x1b[Z"), "shifttab")
+
+    def test_no_bracket_leak(self):
+        for seq in ("\x1b[C", "\x1bOC", "\x1b[1;5C", "\x1b[Z", "\x1b[999~"):
+            self.assertNotIn("[", sv._parse_escape(seq))
