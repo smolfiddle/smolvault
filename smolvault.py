@@ -31,7 +31,12 @@ Highlights
 - Per-read integrity verification — bit-rot fails loudly
 - Entropy gate: media stored raw on a coarse hot stride (~2x faster seal);
   compressible text gets fine-grained CDC + compression
-- Optional password (PBKDF2-HMAC-SHA256 over HTTP Basic)
+- At-rest encryption: per-chunk AES-256-GCM via system OpenSSL,
+  scrypt-wrapped key, dedup preserved (--encrypt / --decrypt)
+- Per-vault message board: clients & server post notes/events (m)
+- Optional password over HTTP Basic; network gate independent of
+  encryption (--auth on|off)
+- Space report: --du breaks down folders, finds double-sealed files
 - Script-friendly: stable exit codes, SMOLVAULT_VAULT env var
 
 Quick start
@@ -2310,7 +2315,7 @@ def choose_match(matches, prompt="choose"):
     return matches[int(raw) - 1]
 
 
-def play_query(store, query, player=None):
+def play_query(store, query, player=None, password=None):
     """Search → pick → spawn player against a private loopback port."""
     explicit_player = player or os.environ.get("SMOLVAULT_PLAYER") or None
     if explicit_player and shutil.which(explicit_player) is None:
@@ -2350,6 +2355,8 @@ def play_query(store, query, player=None):
     t.start()
 
     url = f"http://127.0.0.1:{port}{urllib.parse.quote(path)}"
+    if store.auth_required() and password:
+        url = cred_url(url, password)
     try:
         rc = play_url(url, row.get("mime"), explicit_player)
     except KeyboardInterrupt:
@@ -2429,9 +2436,14 @@ def export_file(store, arg, out=None):
 # Banner
 # ---------------------------------------------------------------------------
 
-def print_banner(vault, s, urls, auth_on, server_state="● running", enc_on=False):
+def print_banner(vault, s, urls, auth_on, server_state="● running",
+                 enc_on=False, auth_required=None):
     state_col = green(server_state) if "running" in server_state else yellow(server_state)
-    auth = "password protected" if auth_on else gray("none")
+    if auth_on:
+        auth = ("LAN streaming open" if auth_required is False
+                else "password protected")
+    else:
+        auth = gray("none")
     if enc_on:
         auth += green(" · AES-256-GCM at rest")
     print(f"""  ┌────────────────────────────────────────────────────────┐
@@ -2564,7 +2576,8 @@ class Wizard:
         state = "● running" if self.srv else "○ stopped"
         print_banner(self.vault, s, (local, net),
                      self.store.has_password(), state,
-                     enc_on=self.store.enc_enabled())
+                     enc_on=self.store.enc_enabled(),
+                     auth_required=self.store.auth_required())
         print(WIZARD_MENU)
 
     # -- prompts ----------------------------------------------------------------
@@ -3331,9 +3344,10 @@ def run_client(spec, player=None):
             try:
                 if key == "l":
                     rows = rv.rows = rv._fetch("/__api/list")
+                    logical = sum(r["size"] for r in rows)
                     render_library(
                         rows, dim(f"  ── {len(rows)} files · "
-                                  f"{fmt(s['logical'])} logical"))
+                                  f"{fmt(logical)} logical"))
                 elif key == "d":
                     rows = rv.rows = rv._fetch("/__api/list")
                     show_du(rows)   # remote vault's stored-bytes stay server-side
@@ -3646,13 +3660,6 @@ def main(argv=None):
     if args.connect is not None:
         return run_client(args.connect, args.player)
 
-    action_flags = any([args.add, args.list, args.du, args.search,
-                        args.play, args.info, args.get])
-    interactive_wizard = (
-        not args.serve and sys.stdin.isatty() and not action_flags
-        and (args.wizard or (
-            args.vault is None and not args.password)))
-
     vault, created = bootstrap_vault(args.vault)
     store = Store(vault)
     if created:
@@ -3664,6 +3671,37 @@ def main(argv=None):
             log.info("password set")
         elif not store.check_password(args.password):
             print(red("incorrect password"))
+            return EXIT_NOMATCH
+
+    action_flags = any([args.add, args.list, args.du, args.search,
+                        args.play, args.info, args.get])
+    interactive_wizard = (
+        not args.serve and sys.stdin.isatty() and not action_flags
+        and (args.wizard or (
+            args.vault is None and not args.password)))
+
+    # ---- encrypted vault: unlock once, everything downstream works -------
+    if store.enc_enabled() and not store.is_unlocked() \
+            and not interactive_wizard:
+        if not sys.stdin.isatty() and not args.password:
+            print(red("vault is encrypted — provide -p/--password"))
+            return EXIT_NOMATCH
+        unlocked = False
+        for _ in range(3):
+            pw_try = args.password or getpass.getpass(
+                dim("  vault password: ")).strip()
+            if not pw_try:
+                return EXIT_NOMATCH
+            try:
+                store.unlock(pw_try)
+                args.password = pw_try      # players may embed it
+                unlocked = True
+                break
+            except ValueError:
+                print(red("  ✗ incorrect password"))
+                if args.password:
+                    break
+        if not unlocked:
             return EXIT_NOMATCH
 
     # ---- vault sync -------------------------------------------------------
@@ -3690,7 +3728,8 @@ def main(argv=None):
         show_matches(matches)
         return EXIT_OK
     if args.play:
-        return play_query(store, args.play, args.player)
+        return play_query(store, args.play, args.player,
+                          password=args.password or None)
     if args.info:
         return show_info(store, args.info)
     if args.get:
@@ -3733,7 +3772,8 @@ def main(argv=None):
     print_banner(vault, s,
                  (f"http://127.0.0.1:{port}/", f"http://{lan_ip()}:{port}/"),
                  store.has_password(),
-                 enc_on=store.enc_enabled())
+                 enc_on=store.enc_enabled(),
+                 auth_required=store.auth_required())
     print(dim("\n  Ctrl+C to stop.\n"))
     try:
         srv.serve_forever()

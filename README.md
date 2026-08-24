@@ -2,7 +2,7 @@
 
 [![python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
 [![dependencies](https://img.shields.io/badge/dependencies-zero-success)](#requirements)
-[![license](https://img.shields.io/badge/license-MIT-green)](../LICENSE.md)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![version](https://img.shields.io/badge/version-0.2.1-lightgrey)
 
 **smolvault is an immutable, content-addressed vault for everything you have —
@@ -62,11 +62,11 @@ phone and the same library streams there.
 
 ```
   ┌────────────────────────────────────────────────────────┐
-    smolvault 0.1.0
+    smolvault 0.2.1
     vault    vault.vault · 12 files · 22.3 GB logical · 11 GB stored
     local    http://127.0.0.1:8100/
     network  http://192.168.1.14:8100/   ● running   ← phone/TV ready
-    auth     password protected
+    auth     password protected · AES-256-GCM at rest
   └────────────────────────────────────────────────────────┘
 
     a add       drag & drop / point at a folder / browse & pick
@@ -117,7 +117,9 @@ After each action the hub collapses to a one-line prompt —
 - **Message board** — each vault carries a small public board (MMO-style):
   clients and the server post notes and system events (`sealed 12 files`,
   `sync pushed X`). Long-poll-free by design: press `m`, read, post.
-- **Optional password** — PBKDF2-HMAC-SHA256 over HTTP Basic.
+- **Optional password** — PBKDF2-HMAC-SHA256 over HTTP Basic; doubles as
+  the encryption key wrapper, and the network gate it controls is an
+  independent switch (`--auth on|off`) so trusted LANs can stream freely.
 
 ## Requirements
 
@@ -215,6 +217,7 @@ No config files — flags and environment only.
 | `SMOLVAULT_PLAYER` | player binary (default `mpv`; `mpvapp` = mpv-android intent) |
 | `SMOLVAULT_SERVER` | default `host:port` for client mode |
 | `SMOLVAULT_DEBUG` | verbose debug output + SIGUSR1 stack dumps |
+| `SMOLVAULT_NAME` | node name on the message board (else hostname) |
 | `NO_COLOR` | disable ANSI color everywhere |
 
 | Flag | Effect |
@@ -239,8 +242,10 @@ No config files — flags and environment only.
 | `GET /__api/list` | JSON listing (path, size, mime, created_at, root_hash) |
 | `POST /__api/msg` | post to the vault's message board `{"body": …}` → 201 |
 | `GET /__api/msg?since=N` | board messages after id N |
+| `GET /__api/auth` | `{"auth": bool}` — whether the password gate is on |
 
 Auth (if set): HTTP Basic, PBKDF2-HMAC-SHA256, 100k iterations.
+Disable it for trusted LANs with `--auth off` — encryption stays on.
 
 ## Benchmarks
 
@@ -249,7 +254,7 @@ Loopback · NVMe · 6 cores ([full sheet](BENCHMARKS.md), reproduce with
 
 | Metric | Result |
 |---|---|
-| Ingest (700 MB seal) | ~20 s (~35 MB/s) — media scans a hot stride |
+| Ingest (700 MB seal) | ~20–24 s (~29–35 MB/s) — media scans a hot stride |
 | Dedup | identical content → **+0 bytes**; WORM reject < 1 ms |
 | Full read 700 MB | **~150 MB/s** hash-verified |
 | Concurrent reads | **230–500 MB/s** aggregate |
@@ -289,8 +294,7 @@ Every promise the docs make, measured ([full sheet](BENCHMARKS.md)):
 | **Crash consistency** — `kill -9` mid-ingest, restart | pre-crash file byte-exact · half-written file invisible (`404`) · `--gc` reclaimed 26 orphans · `--check` PASS |
 | **Multi-viewer storm** — 3 simultaneous decoders + seek noise | ≈**66 fps** aggregate · seek-noise p50 9.3 ms under load |
 | **Write endurance** — 2.8 GB sustained in 45 s | 62 MB/s mean · commit latency *improved* over time (524→480 ms p50) · WAL capped at 32 MB |
-
-| **At-rest encryption cost** — AES-256-GCM on/off | seals ≈15–25% slower · reads within ~20% · range seeks unaffected (6 ms p50) · unlock 85 ms |
+| **At-rest encryption cost** — AES-256-GCM on/off | seals ≈15–25% slower · reads within ~20% · range seeks unaffected (~6–8 ms p50) · unlock ~85 ms |
 | **Message board** — post → readable | ~22 ms roundtrip |
 
 The WORM race test earned its keep: it exposed a real bug (losing writers
@@ -342,7 +346,7 @@ milliseconds — data is never re-encrypted. The message board is visible
 to anyone holding the vault password and is not replicated by sync.
 
 ## Design notes
-smolvault is the distilled successor of [DenseVault](../README.md).
+smolvault is the distilled successor of DenseVault.
 Deliberately absent: delta encoding, WebDAV lock theater, hidden system
 collections, compression pipelines, config files, worker-thread ingest
 pipelines (measured slower on boost-heavy consumer CPUs — the GIL-bound
@@ -375,4 +379,4 @@ about that budget. Reproduce before/after with `python3 benchmark.py`.
 
 ## License
 
-[MIT](../LICENSE.md) — see also the header of `smolvault.py`.
+[MIT](LICENSE) — see also the header of `smolvault.py`.
