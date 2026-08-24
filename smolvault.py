@@ -73,7 +73,7 @@ import zlib
 from collections import Counter, namedtuple
 from socketserver import ThreadingMixIn
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 log = logging.getLogger("smolvault")
 
@@ -1584,14 +1584,11 @@ def gather_add_selections(paths, asker, interactive, force_pick=False):
             else:
                 mode = ""
             if mode == "b":
-                rows = [{"path": rel, "size": os.path.getsize(p)}
-                        for p, rel in got]
-                picked = multi_pick(rows)
-                if picked is None:
+                picked = browse_picker(src)
+                if not picked:
                     print(yellow("  (folder skipped)"))
                     continue
-                abs_by_rel = {rel: full for full, rel in got}
-                items.extend((abs_by_rel[p], p) for p, _ in picked)
+                items.extend(picked)
             else:
                 items.extend(got)
             if not suggest:
@@ -2263,6 +2260,261 @@ def multi_pick(rows):
     return live_search(rows, player_label="add", multi=True)
 
 
+# ---------------------------------------------------------------------------
+# Browse navigator — a tiny file manager over the raw-mode toolkit
+# ---------------------------------------------------------------------------
+
+class BrowseState:
+    """Pure-logic directory navigator (no I/O beyond directory listing).
+    Selections are relpaths (posix) relative to *root*; selecting a
+    directory means its entire subtree."""
+
+    def __init__(self, root):
+        self.root = os.path.abspath(root)
+        self.cur = self.root
+        self.checked = set()
+        self.query = ""
+        self.sel = 0
+        self._subtree_cache = {}
+
+    # -- listing ----------------------------------------------------------
+    def _scan(self, d):
+        out = []
+        try:
+            for e in os.scandir(d):
+                if e.name.startswith("."):
+                    continue
+                try:
+                    is_dir = e.is_dir(follow_symlinks=False)
+                    size = 0 if is_dir else e.stat().st_size
+                except OSError:
+                    continue
+                out.append((e.name, is_dir, size))
+        except OSError:
+            pass
+        dirs = sorted(((n, True, s) for n, is_d, s in out if is_d),
+                      key=lambda t: natural_key(t[0]))
+        files = sorted(((n, False, s) for n, is_d, s in out if not is_d),
+                       key=lambda t: natural_key(t[0]))
+        return dirs + files
+
+    def _rel(self, abspath):
+        return os.path.relpath(abspath, self.root).replace(os.sep, "/")
+
+    def entries(self):
+        """Filtered, ordered visible entries:
+        [(name, is_dir, size, relpath)]."""
+        q = self.query.lower()
+        out = []
+        for name, is_dir, size in self._scan(self.cur):
+            if q and q not in name.lower():
+                continue
+            out.append((name, is_dir, size,
+                        self._rel(os.path.join(self.cur, name))))
+        return out
+
+    def current(self):
+        es = self.entries()
+        return es[self.sel] if 0 <= self.sel < len(es) else None
+
+    # -- navigation -------------------------------------------------------
+    def descend(self):
+        e = self.current()
+        if e and e[1]:
+            self.cur = os.path.join(self.cur, e[0])
+            self.query = ""
+            self.sel = 0
+
+    def parent(self):
+        if os.path.abspath(self.cur) != self.root:
+            self.cur = os.path.dirname(self.cur)
+            self.query = ""
+            self.sel = 0
+
+    # -- selection --------------------------------------------------------
+    def _subtree_files(self, rel_dir):
+        if rel_dir not in self._subtree_cache:
+            base = os.path.join(self.root, rel_dir)
+            acc = set()
+            for dp, dns, fns in os.walk(base):
+                dns[:] = [x for x in dns if not x.startswith(".")]
+                for fn in fns:
+                    if fn.startswith("."):
+                        continue
+                    p = os.path.join(dp, fn)
+                    if os.path.isfile(p):
+                        acc.add(self._rel(p))
+            self._subtree_cache[rel_dir] = frozenset(acc)
+        return self._subtree_cache[rel_dir]
+
+    def dir_marker(self, rel_dir):
+        """(selected, total) file counts under a dir; None when empty."""
+        files = self._subtree_files(rel_dir)
+        if not files:
+            return None
+        return len(files & self.checked), len(files)
+
+    def toggle(self):
+        e = self.current()
+        if not e:
+            return
+        name, is_dir, size, rel = e
+        if is_dir:
+            self.toggle_subtree(rel)
+        else:
+            self.checked.symmetric_difference_update({rel})
+
+    def toggle_subtree(self, rel_dir):
+        """Cycle: partial → fully selected → none."""
+        files = self._subtree_files(rel_dir)
+        if files <= self.checked:
+            self.checked -= files
+        else:
+            self.checked |= files
+
+    def select_visible(self):
+        for name, is_dir, size, rel in self.entries():
+            if is_dir:
+                self.checked |= self._subtree_files(rel)
+            else:
+                self.checked.add(rel)
+
+    def clear(self):
+        self.checked.clear()
+
+    def confirm_items(self):
+        """Selection → [(abspath, relpath)], natural-sorted by relpath."""
+        return [(os.path.join(self.root, rel), rel)
+                for rel in sorted(self.checked, key=natural_key)]
+
+
+def _browse_render(st):
+    rel = os.path.relpath(st.cur, st.root)
+    head = "  add ❯ " + ("/" if rel == "." else f"/{rel}")
+    if st.query:
+        head += dim(f"   filter '{st.query}'")
+    es = st.entries()
+    st.sel = min(st.sel, max(len(es) - 1, 0))
+    partial = full = 0
+    for name, is_dir, size, r in es:
+        if is_dir:
+            mk = st.dir_marker(r)
+            if mk:
+                if mk[0] == mk[1]:
+                    full += 1
+                elif mk[0]:
+                    partial += 1
+    counts = dim(f"   ✓{len(st.checked)}")
+    if partial:
+        counts += yellow(f" · ◐{partial}")
+    if full:
+        counts += green(f" · ✓{full} dirs")
+    counts += dim(f"   {len(es)} shown")
+
+    B = "─" * 66
+    lines = [head + counts, dim("  " + B)]
+    lo = max(0, min(st.sel - 6, len(es) - 12))
+    for i, (name, is_dir, size, r) in enumerate(es[lo:lo + 12], lo):
+        cursor = "  ❯ " if i == st.sel else "    "
+        if is_dir:
+            mk = st.dir_marker(r)
+            if mk:
+                sel_n, tot_n = mk
+                mark = (green(f"✓ {sel_n}/{tot_n}") if sel_n == tot_n
+                        else (yellow(f"◐ {sel_n}/{tot_n}") if sel_n
+                              else dim(f"○ {tot_n}")))
+            else:
+                mark = dim("empty")
+            pad = " " * max(1, 40 - len(name))
+            lines.append(f"{cursor}{cyan(name + '/')}{pad}{mark}")
+        else:
+            tick = green("✓ ") if r in st.checked else "  "
+            lines.append(f"{cursor}{tick}{name}"
+                         + dim(f"   {fmt(size)}"))
+    lines.append(dim("  " + B))
+    lines.append(dim("  → open · ← up · space ✓ · a all · u none · "
+                     "s seal ✓" + str(len(st.checked)) + " · esc"))
+    return "\n".join(lines) + "\r"
+
+
+def browse_picker(root):
+    """Directory navigator. Returns [(abspath, relpath)] or None on cancel.
+
+    Real terminal: full navigator (descend/ascend, subtree toggles,
+    live filter). Non-TTY: falls back to the flat multi-pick."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()
+            and _termios_available()):
+        items, _h, _b = collect_files(root)
+        rows = [{"path": rel, "size": os.path.getsize(full)}
+                for full, rel in items]
+        m = {rel: full for full, rel in items}
+        picked = multi_pick(rows)
+        if not picked:
+            return None
+        return [(m[p], p) for p, _ in picked]
+
+    import termios
+    import tty
+    st = BrowseState(root)
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\x1b[?25l")
+        while True:
+            sys.stdout.write(_browse_render(st))
+            sys.stdout.flush()
+            ch = sys.stdin.read(1)
+            n = len(st.entries())
+            if ch == "\x1b":
+                r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if r:
+                    b = sys.stdin.read(1)
+                    if b == "[":
+                        d = sys.stdin.read(1)
+                        if d == "C":
+                            st.descend()
+                        elif d == "D":
+                            st.parent()
+                        elif d == "A":
+                            st.sel = max(0, st.sel - 1)
+                        elif d == "B":
+                            st.sel = min(max(n - 1, 0), st.sel + 1)
+                    continue
+                return None                      # bare Esc cancels
+            if ch == "\x03":
+                return None
+            if ch in ("\r", "\n"):
+                e = st.current()
+                if e and e[1]:
+                    st.descend()
+                else:
+                    st.toggle()
+            elif ch == " ":
+                st.toggle()
+            elif ch in ("\x7f", "\b"):
+                if st.query:
+                    st.query = st.query[:-1]
+                    st.sel = 0
+                else:
+                    st.parent()
+            elif ch == "a":
+                st.select_visible()
+            elif ch == "u":
+                st.clear()
+            elif ch == "s":
+                return st.confirm_items()
+            elif ch in ("\x04",):                # Ctrl+D cancels
+                return None
+            elif ch >= " ":
+                st.query += ch
+                st.sel = 0
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\r\x1b[J\x1b[?25h")
+        sys.stdout.flush()
+
+
 def _termios_available():
     try:
         import termios                              # noqa: F401
@@ -2601,9 +2853,13 @@ class Wizard:
             if not os.path.isdir(folder):
                 print(red(f"  ✗ no such folder: {folder}"))
                 return
-            items, suggest = gather_add_selections(
-                [folder], lambda p: self.ask(p), interactive=True,
-                force_pick=True)
+            picked = browse_picker(folder)
+            if not picked:
+                print(yellow("  (nothing selected)"))
+                return
+            items = list(picked)
+            suggest = "/" + (os.path.basename(folder.rstrip(os.sep))
+                             or "") + "/"
         elif line.strip():
             try:
                 items, suggest = gather_add_selections(
@@ -3445,9 +3701,14 @@ def run_client(spec, player=None):
                         if not os.path.isdir(folder):
                             print(red(f"  ✗ no such folder: {folder}"))
                             continue
-                        items, suggest = gather_add_selections(
-                            [folder], lambda p: input(p).strip(),
-                            interactive=True, force_pick=True)
+                        picked = browse_picker(folder)
+                        if not picked:
+                            print(yellow("  (nothing selected)"))
+                            continue
+                        items = list(picked)
+                        suggest = "/" + (
+                            os.path.basename(folder.rstrip(os.sep))
+                            or "") + "/"
                     else:
                         items, suggest = gather_add_selections(
                             shlex.split(line),

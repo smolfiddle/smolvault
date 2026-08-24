@@ -3,7 +3,7 @@
 [![python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
 [![dependencies](https://img.shields.io/badge/dependencies-zero-success)](#requirements)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-![version](https://img.shields.io/badge/version-0.2.1-lightgrey)
+![version](https://img.shields.io/badge/version-0.2.2-lightgrey)
 
 **smolvault is an immutable, content-addressed vault for everything you have —
 that speaks just enough HTTP to be mistaken for a local disk.**
@@ -45,8 +45,11 @@ Press `a`, drag any files from your file manager into the terminal, Enter:
   ── 1 added · 0 skipped · 0 failed · 8.4 GB of 8.4 GB newly stored (0% saved)
 ```
 
-Point it at a folder to ingest a whole tree (or `[b]` to browse & multi-pick),
-then press `p` and start typing — results filter as you type:
+Point it at a folder to ingest a whole tree — or `[b]` to open the
+**browse navigator**, a tiny file manager: `→` descend, `←` up, Space
+toggles (on a folder = its whole subtree, `◐ n/m` while partial), `a`
+select-all, live filter, `s` seals. Then press `p` and start typing —
+results filter as you type:
 
 ```
   watch ❯ dune · 2
