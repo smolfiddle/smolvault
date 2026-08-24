@@ -2916,6 +2916,13 @@ def board_live(store=None, fetch=None, send=None, read_key=None,
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
         tty.setraw(fd)
+
+        def read_key():                       # default: real keyboard
+            r, _, _ = select.select([fd], [], [], 0.2)
+            if not r:
+                return "tick"                 # poll tick — re-render
+            k = _read_key(fd)
+            return k if k is not None else "esc"   # stdin EOF → exit
     last_poll = 0.0
 
     def drain_and_render():
