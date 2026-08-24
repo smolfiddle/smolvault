@@ -1553,7 +1553,7 @@ def collect_files(root):
     return items, hidden, broken
 
 
-def gather_add_selections(paths, asker, interactive):
+def gather_add_selections(paths, asker, interactive, force_pick=False):
     """Expand user-supplied paths into sealable items.
 
     Files stay loose (dest name None → caller picks basename). Folders walk
@@ -1575,7 +1575,9 @@ def gather_add_selections(paths, asker, interactive):
             if not got:
                 print(yellow(f"  (nothing to ingest in {src})"))
                 continue
-            if interactive:
+            if force_pick:
+                mode = "b"
+            elif interactive:
                 mode = (asker(f"  {src} — [Enter]=whole folder "
                               f"({len(got)} files) · [b]=browse & pick: ")
                         .strip().lower())
@@ -1588,7 +1590,7 @@ def gather_add_selections(paths, asker, interactive):
                 if picked is None:
                     print(yellow("  (folder skipped)"))
                     continue
-                abs_by_rel = dict(got)
+                abs_by_rel = {rel: full for full, rel in got}
                 items.extend((abs_by_rel[p], p) for p, _ in picked)
             else:
                 items.extend(got)
@@ -2591,14 +2593,25 @@ class Wizard:
     # -- actions ------------------------------------------------------------------
 
     def do_add(self):
-        line = self.ask("  drop files here (or type paths), Enter:\n  ❯ ")
-        if not line.strip():
-            return
-        try:
+        line = self.ask("  drop files · type a path · [b]rowse a folder:"
+                        "\n  ❯ ")
+        if line.strip().lower() in ("b", "browse"):
+            folder = self.ask(dim("  folder to browse [cwd]: ")).strip()
+            folder = os.path.abspath(os.path.expanduser(folder or "."))
+            if not os.path.isdir(folder):
+                print(red(f"  ✗ no such folder: {folder}"))
+                return
             items, suggest = gather_add_selections(
-                shlex.split(line), lambda p: self.ask(p), interactive=True)
-        except (EOFError, KeyboardInterrupt):
-            print()
+                [folder], lambda p: self.ask(p), interactive=True,
+                force_pick=True)
+        elif line.strip():
+            try:
+                items, suggest = gather_add_selections(
+                    shlex.split(line), lambda p: self.ask(p), interactive=True)
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+        else:
             return
         if not items:
             return
@@ -3420,13 +3433,25 @@ def run_client(spec, player=None):
                                   "for direct clipboard)"))
 
                 elif key == "a":
-                    line = input("  drop files here (or type paths), Enter:\n"
-                                 "  ❯ ").strip()
+                    line = input("  drop files · type a path · [b]rowse:"
+                                 "\n  ❯ ").strip()
                     if not line:
                         continue
-                    items, suggest = gather_add_selections(
-                        shlex.split(line),
-                        lambda p: input(p).strip(), interactive=True)
+                    if line.lower() in ("b", "browse"):
+                        folder = input(dim("  folder to browse [cwd]: ")
+                                       ).strip()
+                        folder = os.path.abspath(
+                            os.path.expanduser(folder or "."))
+                        if not os.path.isdir(folder):
+                            print(red(f"  ✗ no such folder: {folder}"))
+                            continue
+                        items, suggest = gather_add_selections(
+                            [folder], lambda p: input(p).strip(),
+                            interactive=True, force_pick=True)
+                    else:
+                        items, suggest = gather_add_selections(
+                            shlex.split(line),
+                            lambda p: input(p).strip(), interactive=True)
                     if not items:
                         continue
                     into = input(dim(f"  into folder? [{suggest}]") + " ") \
