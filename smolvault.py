@@ -82,6 +82,7 @@ log = logging.getLogger("smolvault")
 EXIT_OK, EXIT_NOMATCH, EXIT_USAGE = 0, 1, 2
 
 NODE_NAME = None                   # set by --name / SMOLVAULT_NAME
+_feed_muted = threading.Event()    # set when a raw-mode view owns stdout
 
 
 # ---------------------------------------------------------------------------
@@ -1087,7 +1088,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
         finally:
             code = self._sm_code
-            if code:
+            if code and not _feed_muted.is_set():
                 sent = self._wfile_count.n - base
                 dur = (time.perf_counter() - t0) * 1000
                 color = _STATUS_COLOR.get(code // 100, lambda t: t)
@@ -2937,6 +2938,7 @@ def board_live(store=None, fetch=None, send=None, read_key=None,
         sys.stdout.write(_board_render(view[-20:], buf, label))
         sys.stdout.flush()
 
+    _feed_muted.set()
     try:
         if interactive:
             sys.stdout.write("\x1b[2J\x1b[H\x1b[?25l")
@@ -2982,6 +2984,7 @@ def board_live(store=None, fetch=None, send=None, read_key=None,
     except KeyboardInterrupt:
         pass
     finally:
+        _feed_muted.clear()
         if fd is not None:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
         sys.stdout.write("\r\x1b[J\x1b[?25h")
