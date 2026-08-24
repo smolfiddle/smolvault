@@ -2926,6 +2926,7 @@ def board_live(store=None, fetch=None, send=None, read_key=None,
     last_poll = 0.0
 
     def drain_and_render():
+        nonlocal last
         try:
             fresh = load(last)
             for m in fresh:
