@@ -2,8 +2,8 @@
 
 [![python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
 [![dependencies](https://img.shields.io/badge/dependencies-zero-success)](#requirements)
-[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-![version](https://img.shields.io/badge/version-0.2.0-lightgrey)
+[![license](https://img.shields.io/badge/license-MIT-green)](../LICENSE.md)
+![version](https://img.shields.io/badge/version-0.2.1-lightgrey)
 
 **smolvault is an immutable, content-addressed vault for everything you have —
 that speaks just enough HTTP to be mistaken for a local disk.**
@@ -226,6 +226,7 @@ No config files — flags and environment only.
 | `--du` | space by folder + byte-identical duplicate report |
 | `--encrypt` / `--decrypt` | toggle at-rest encryption in place (resumable) |
 | `--name NAME` | node name on the message board (default hostname) |
+| `--auth on\|off` | require the vault password over HTTP — **independent of encryption**: `off` keeps files sealed at rest while streaming openly on trusted LANs |
 | `--check` / `--gc` | verify all chunks / reclaim orphaned chunks |
 
 ### HTTP API
@@ -329,13 +330,19 @@ backup of `vault.vault`. Chunks are unreadable without your password.
   working, which means an attacker who already knows a file's exact bytes
   can confirm it exists in your vault.
 
+**Auth vs encryption are independent:** encryption always protects the
+stored bytes; whether *network requests* need the password is a separate
+switch (`--auth on|off`, default on). Media-server on a trusted LAN?
+`--auth off` gives players password-free streaming while everything stays
+sealed on disk.
+
 Passphrase strength matters: the key is only as strong as the password
 wrapping it (scrypt, n=2¹⁵). Password changes re-wrap the master key in
 milliseconds — data is never re-encrypted. The message board is visible
 to anyone holding the vault password and is not replicated by sync.
 
 ## Design notes
-smolvault is the distilled successor of DenseVault (private predecessor).
+smolvault is the distilled successor of [DenseVault](../README.md).
 Deliberately absent: delta encoding, WebDAV lock theater, hidden system
 collections, compression pipelines, config files, worker-thread ingest
 pipelines (measured slower on boost-heavy consumer CPUs — the GIL-bound
@@ -368,4 +375,4 @@ about that budget. Reproduce before/after with `python3 benchmark.py`.
 
 ## License
 
-[MIT](LICENSE) — see also the header of `smolvault.py`.
+[MIT](../LICENSE.md) — see also the header of `smolvault.py`.

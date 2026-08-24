@@ -68,7 +68,7 @@ import zlib
 from collections import Counter, namedtuple
 from socketserver import ThreadingMixIn
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 log = logging.getLogger("smolvault")
 
@@ -515,6 +515,20 @@ class Store:
         calc = hashlib.pbkdf2_hmac("sha256", password.encode(),
                                    bytes.fromhex(d["salt"]), 100_000)
         return hmac.compare_digest(calc, bytes.fromhex(d["hash"]))
+
+    # ---- HTTP auth gate (decoupled from at-rest encryption) ----------------
+
+    def auth_required(self):
+        """Whether network requests need the password. Independent of
+        encryption: a vault can be sealed at rest while streaming openly on
+        a trusted LAN."""
+        if not self.has_password():
+            return False
+        v = self.cfg_get("auth_req")
+        return True if v is None else v == "1"
+
+    def set_auth_required(self, on):
+        self.cfg_set("auth_req", "1" if on else "0")
 
     # ---- at-rest encryption (convergent, dedup-preserving) ----------------
 
@@ -1094,6 +1108,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _authed(self):
         if not self.store.has_password():
             return True
+        if not self.store.auth_required():
+            return True              # at-rest only: LAN streaming stays open
         hdr = self.headers.get("Authorization", "")
         try:
             kind, blob = hdr.split(None, 1)
@@ -1194,6 +1210,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if _norm(self.path) == "/__api/list":
             self._api_list()
             return
+        if _norm(self.path) == "/__api/auth":
+            self._api_auth_state()
+            return
         if _norm(self.path).split("?")[0] == "/__api/msg":
             self._api_msg()
             return
@@ -1277,6 +1296,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                           "kind": r["kind"], "body": r["body"]} for r in rows],
             "last": rows[-1]["id"] if rows else since,
         }).encode()
+        self._head(200, len(payload), None, "application/json",
+                   {"Cache-Control": "no-store"})
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _api_auth_state(self):
+        payload = json.dumps({"auth": self.store.auth_required()}).encode()
         self._head(200, len(payload), None, "application/json",
                    {"Cache-Control": "no-store"})
         self.end_headers()
@@ -1404,6 +1430,17 @@ def lan_ip():
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def cred_url(url, password):
+    """Embed Basic-auth credentials as userinfo so players that never
+    prompt (mpv, mpv-android intents) can fetch authenticated media.
+    No-op when there's no password or it's already embedded."""
+    import urllib.parse as up
+    if not password or "@" in url.split("//", 1)[-1].split("/")[0]:
+        return url
+    return url.replace("//", "//smolvault:" + up.quote(password, safe="")
+                       + "@", 1)
 
 
 def _node_name():
@@ -2482,6 +2519,7 @@ class Wizard:
         self.srv = None
         self.port = None
         self.last_interrupt = 0.0
+        self.pw = None                    # remembered for player URLs
 
     # -- server toggle ------------------------------------------------------
 
@@ -2590,6 +2628,8 @@ class Wizard:
 
         def spawn(p):
             url = base + urllib.parse.quote(p)
+            if self.store.auth_required() and self.pw:
+                url = cred_url(url, self.pw)
             return play_url(url, mime, explicit_player)
 
         try:
@@ -2664,7 +2704,8 @@ class Wizard:
                     if not pw:
                         return EXIT_NOMATCH
                     try:
-                        self.store.unlock(pw); break
+                        self.store.unlock(pw)
+                        self.pw = pw; break
                     except ValueError:
                         print(red("  ✗ wrong password"))
                 else:
@@ -2674,6 +2715,7 @@ class Wizard:
                     dim(f"  {self.vault} — set password (Enter = no auth): ")).strip()
                 if pwd:
                     self.store.set_password(pwd)
+                    self.pw = pwd
                     print(green("  ✓ password set"))
                     if sys.stdin.isatty():
                         try:
@@ -2684,9 +2726,20 @@ class Wizard:
                             ans = ""
                         if ans == "y":
                             self.store.enable_encryption(pwd)
+                            self.pw = pwd
                             n = self.store.migrate_encryption()
                             print(green(f"  ✓ encrypted at rest · "
                                         f"{n} chunk(s) rewritten"))
+                            try:
+                                open_ans = input(cyan(
+                                    "  require password for network "
+                                    "access? [Y/n]: ")).strip().lower()
+                            except (EOFError, KeyboardInterrupt):
+                                open_ans = ""
+                            if open_ans == "n":
+                                self.store.set_auth_required(False)
+                                print(yellow("  ○ LAN streaming stays open "
+                                             "(files still encrypted)"))
         except EOFError:
             print()
 
@@ -2749,6 +2802,9 @@ class Wizard:
         else:
             path = _norm(q)
         url = f"http://{lan_ip()}:{self.port}{urllib.parse.quote(path)}"
+        if self.store.auth_required():
+            print(dim("  (players will ask for the vault password — "
+                      "VLC prompts; mpv needs user:pass@ in the URL)"))
         if _clipboard_set(url):
             print(green(f"  ✓ copied {url}"))
         else:
@@ -2898,11 +2954,30 @@ class RemoteVault:
     def url_for(self, path):
         return self.base + urllib.parse.quote(path)
 
+    def cred_url(self, path):
+        url = self.url_for(path)
+        if self.password and self.store_requires_auth():
+            url = url.replace("//", "//smolvault:"
+                              + urllib.parse.quote(self.password,
+                                                   safe="") + "@", 1)
+        return url
+
+    def store_requires_auth(self):
+        """Probe the vault once without credentials: 401 ⇒ gated."""
+        import http.client as hc
+        try:
+            conn = hc.HTTPConnection(self.host, self.port, timeout=5)
+            conn.request("GET", "/__api/auth")
+            r = conn.getresponse(); r.read(); conn.close()
+            return r.status == 401
+        except Exception:
+            return True                      # assume gated on uncertainty
+
     def watch(self, path, mime, player=None):
         if not (mime or "").startswith(("video/", "audio/", "image/")):
             print(yellow(f"  '{path}' is {mime} — not watchable. Use [g]."))
             return EXIT_NOMATCH
-        return play_url(self.url_for(path), mime, player)
+        return play_url(self.cred_url(path), mime, player)
 
     def export(self, path, out=None):
         out = out or os.path.basename(path)
@@ -3287,8 +3362,7 @@ def run_client(spec, player=None):
                         continue
 
                     def spawn(p, _rv=rv, _pl=explicit_pl):
-                        url = _rv.url_for(p)
-                        return play_url(url, mime, _pl)
+                        return play_url(_rv.cred_url(p), mime, _pl)
 
                     watch_flow(spawn, path,
                                [r["path"] for r in rows],
@@ -3418,6 +3492,9 @@ def build_parser():
     ap.add_argument("-p", "--password", default="")
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--check", action="store_true", help="verify chunks, exit")
+    ap.add_argument("--auth", choices=["on", "off"], metavar="on|off",
+                    help="require the vault password for network access "
+                         "(independent of encryption; default on)")
     ap.add_argument("--encrypt", action="store_true",
                     help="encrypt the whole vault at rest (AES-256-GCM), exit")
     ap.add_argument("--decrypt", action="store_true",
@@ -3476,6 +3553,17 @@ def main(argv=None):
         if args.check:
             return EXIT_OK if store.check() else EXIT_NOMATCH
         store.gc()
+        return EXIT_OK
+
+    # ---- network-auth gate toggle --------------------------------------
+    if getattr(args, "auth", None):
+        if not args.vault:
+            ap.error("vault required for --auth")
+        st_ = Store(args.vault)
+        st_.set_auth_required(args.auth == "on")
+        print(green(f"  ✓ network auth {'required' if args.auth == 'on' else 'disabled'}"
+                    + (" (files stay encrypted at rest)"
+                       if st_.enc_enabled() else "")))
         return EXIT_OK
 
     # ---- at-rest encryption -------------------------------------------
