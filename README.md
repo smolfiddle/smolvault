@@ -267,13 +267,13 @@ Loopback · NVMe · 6 cores ([full sheet](BENCHMARKS.md), reproduce with
 
 | Metric | Result |
 |---|---|
-| Ingest (700 MB seal) | ~20–24 s (~29–35 MB/s) — media scans a hot stride |
+| Ingest (700 MB seal) | ~14 s (~51 MB/s) — media scans a hot stride |
 | Dedup | identical content → **+0 bytes**; WORM reject < 1 ms |
-| Full read 700 MB | **~150 MB/s** hash-verified |
-| Concurrent reads | **230–533 MB/s** aggregate |
-| Range read p50/p95 | **~5–8 ms / 12–17 ms** (256 KB, keep-alive) |
-| Playback vs local disk | startup ≈+0.2 s · deep seek ≈+0.0–0.1 s |
-| Vault sync | push @ **13–17 MB/s** · no-op re-sync **< 20 ms** |
+| Full read 700 MB | **~150–550 MB/s** hash-verified (cold / warm cache) |
+| Concurrent reads | **230–725 MB/s** aggregate |
+| Range read p50/p95 | **~2–6 ms / 3–17 ms** (256 KB, keep-alive) |
+| Playback vs local disk | startup ≈+0.0–0.2 s · deep seek ≈+0.0 s |
+| Vault sync | push @ **13–35 MB/s** · no-op re-sync **< 25 ms** |
 
 ### On a 1 GB box
 
@@ -283,10 +283,10 @@ sealed and streamed back out of it:
 
 | Metric | Result |
 |---|---|
-| PUT 700 MB into the constrained server | 201 · **~47 MB/s** |
+| PUT 700 MB into the constrained server | 201 · **~48–68 MB/s** |
 | GET full + sha256 verify | byte-exact |
-| Seek p50/p95 | 13 ms / 39 ms |
-| Server peak memory | **~800–880 MB of 1024** (incl. reclaimable mmap cache) |
+| Seek p50/p95 | 5 ms / 21 ms |
+| Server peak memory | **~400–880 MB of 1024** (incl. reclaimable mmap cache) |
 
 Memory stays flat because files stream in chunks — the ceiling is your disk,
 not your RAM. Reproduce with `python3 benchmark.py --lowmem` (Linux +
@@ -300,15 +300,16 @@ Every promise the docs make, measured ([full sheet](BENCHMARKS.md)):
 | Promise | Measured |
 |---|---|
 | **CDC survives edits** — insert 1 MB mid-file into 192 MB, re-seal | **≈50–98% deduped** (varies with edit position/content) · effective write speed still *exceeds* naive copy |
-| **Small-file reality** — 1500 mixed 0–64 KB files | **~370 files/s** · seal p50 ~1 ms |
-| **Library scale** — 10k / 50k entries | `--list` 19 / 113 ms · search 25 / 139 ms · `du` 6 / 33 ms |
-| **Reads don't block on writes** — 6 range-readers during a 256 MB PUT | 1991 reads · p50 **29 ms** / p95 78 ms while writer ran at 22 MB/s |
+| **Small-file reality** — 1500 mixed 0–64 KB files | **370–544 files/s** · seal p50 0.5–1 ms |
+| **Library scale** — 10k / 50k entries | `--list` 7 / 70 ms · search 18 / 88 ms · `du` 5 / 22 ms |
+| **Reads don't block on writes** — 6 range-readers during a 256 MB PUT | 1560 reads · p50 **23 ms** / p95 63 ms while writer ran at 35 MB/s |
 | **WORM is race-safe** — 12 parallel PUTs, same path | exactly **1×201 + 11×409** in ~1 s, file serves intact after |
-| **Crash consistency** — `kill -9` mid-ingest, restart | pre-crash file byte-exact · half-written file invisible (`404`) · `--gc` reclaimed 26 orphans · `--check` PASS |
-| **Multi-viewer storm** — 3 simultaneous decoders + seek noise | ≈**66 fps** aggregate · seek-noise p50 9.3 ms under load |
-| **Write endurance** — 2.8 GB sustained in 45 s | 62 MB/s mean · commit latency *improved* over time (524→480 ms p50) · WAL capped at 32 MB |
-| **At-rest encryption cost** — AES-256-GCM on/off | seals ≈15–25% slower · reads within ~20% · range seeks unaffected (~6–8 ms p50) · unlock ~85 ms |
-| **Message board** — post → readable | ~22 ms roundtrip |
+| **Crash consistency** — `kill -9` mid-ingest, restart | pre-crash file byte-exact · half-written file invisible (`404`) · `--gc` reclaimed orphans · `--check` PASS |
+| **Multi-viewer storm** — 3 simultaneous decoders + seek noise | ≈**64 fps** aggregate · seek-noise p50 4.2 ms under load |
+| **Write endurance** — 5 GB sustained in 45 s | 113 MB/s mean · commit latency stable (259→293 ms p50) · WAL capped at 32 MB |
+| **At-rest encryption cost** — AES-256-GCM on/off | seals ≈14–25% slower · reads within ~40% · range seeks unaffected (2.5 ms p50) · unlock ~42 ms |
+| **Message board** — post → readable | ~0.3 ms roundtrip |
+| **Remote ingest** — `--share-root`, 96 MB via one POST | **82.7 MB/s** server-side · 20-file batch in 160 ms · traversal → `403` |
 | **Remote ingest** — `--share-root`, 2 paths via one POST | sealed server-side in ~2 ms · traversal attempts → `403` · re-ingest → `409` |
 
 The WORM race test earned its keep: it exposed a real bug (losing writers
