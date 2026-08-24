@@ -1216,6 +1216,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if _norm(self.path) == "/__api/auth":
             self._api_auth_state()
             return
+        if _norm(self.path).split("?")[0] == "/__api/browse":
+            self._api_browse()
+            return
         if _norm(self.path).split("?")[0] == "/__api/msg":
             self._api_msg()
             return
@@ -1307,8 +1310,140 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _share_root(self):
+        sr = self.store.cfg_get("share_root")
+        return os.path.realpath(sr) if sr else None
+
+    def _api_browse(self):
+        """GET /__api/browse?dir=REL — listing under --share-root."""
+        sr = self._share_root()
+        if not sr:
+            self._head(403, 0, extra={"Content-Type": "text/plain"})
+            self.end_headers()
+            self.wfile.write(b"share root not enabled on this vault\n")
+            return
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        rel = q.get("dir", [""])[0]
+        want_files = q.get("recursive", ["0"])[0] == "1"
+        target = os.path.realpath(os.path.join(sr, rel.lstrip("/")))
+        if os.path.commonpath([target, sr]) != sr:
+            self._head(403, 0, extra={"Content-Type": "text/plain"})
+            self.end_headers()
+            self.wfile.write(b"path escapes share root\n")
+            return
+        if want_files:
+            files = []
+            for dp, dns, fns in os.walk(target):
+                dns[:] = [x for x in dns
+                          if not x.startswith(".") and x != "__pycache__"]
+                for fn in fns:
+                    if fn.startswith("."):
+                        continue
+                    p = os.path.join(dp, fn)
+                    if os.path.isfile(p):
+                        files.append({
+                            "path": os.path.relpath(p, sr).replace(os.sep, "/"),
+                            "size": os.path.getsize(p)})
+            files.sort(key=lambda x: natural_key(x["path"]))
+            payload = json.dumps({"files": files}).encode()
+        else:
+            entries = [{"name": n, "is_dir": is_d, "size": s}
+                       for n, is_d, s in scan_dir(target)]
+            rel_norm = os.path.relpath(target, sr).replace(os.sep, "/")
+            payload = json.dumps({"dir": "" if rel_norm == "." else rel_norm,
+                                  "entries": entries}).encode()
+        self._head(200, len(payload), None, "application/json",
+                   {"Cache-Control": "no-store"})
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _api_ingest(self):
+        """POST /__api/ingest {paths:[rel…], into} — seal server-local
+        files under --share-root into this vault (additive WORM)."""
+        sr = self._share_root()
+        if not sr:
+            self._head(403, 0, extra={"Content-Type": "text/plain"})
+            self.end_headers()
+            self.wfile.write(b"share root not enabled on this vault\n")
+            return
+        length = int(self.headers.get("Content-Length") or -1)
+        if length <= 0 or length > 262144:
+            self._head(400, 0); self.end_headers(); return
+        try:
+            req = json.loads(self.rfile.read(length))
+            rels = [str(p) for p in req.get("paths", [])][:200]
+            into = str(req.get("into", "/")) or "/"
+        except (ValueError, json.JSONDecodeError):
+            self._head(400, 0); self.end_headers(); return
+
+        def contained(p):
+            return os.path.commonpath([p, sr]) == sr
+
+        def queue(abs_target):
+            """Expand one accepted path into (abs_file, rel_label) jobs.
+            Directories walk recursively; missing paths yield a 404 marker."""
+            if os.path.isfile(abs_target):
+                yield abs_target, None
+                return
+            if not os.path.isdir(abs_target):
+                yield None, None
+                return
+            for dp, dns, fns in os.walk(abs_target):
+                dns[:] = [x for x in dns
+                          if not x.startswith(".") and x != "__pycache__"]
+                for fn in sorted(fns, key=natural_key):
+                    if fn.startswith("."):
+                        continue
+                    fp = os.path.join(dp, fn)
+                    if os.path.isfile(fp):
+                        yield fp, None
+
+        results = []
+        jobs = []
+        seen_files = set()
+        for rel in rels:
+            target = os.path.realpath(os.path.join(sr, rel.lstrip("/")))
+            if not contained(target):
+                results.append({"path": rel, "status": 403})
+                continue
+            found = False
+            for abs_f, _ in queue(target):
+                found = True
+                if abs_f is None:
+                    continue
+                if abs_f in seen_files:
+                    continue
+                seen_files.add(abs_f)
+                rel_f = os.path.relpath(abs_f, sr).replace(os.sep, "/")
+                dest_dir = ("/" + into.strip("/") + "/") \
+                    if into.strip("/") else "/"
+                jobs.append((abs_f, dest_dir + rel_f, rel_f))
+            if not found:
+                results.append({"path": rel, "status": 404})
+
+        for abs_f, dest, rel_f in jobs:
+            try:
+                with open(abs_f, "rb") as f:
+                    res = self.store.put(dest, f)
+                results.append({"path": rel_f, "status": 201,
+                                "dest": dest, "size": res.size})
+                log.info("%s %s  (%s) · remote-ingest", green("sealed"),
+                         dest, fmt(res.size))
+            except ExistsError:
+                results.append({"path": rel_f, "status": 409, "dest": dest})
+            except OSError as e:
+                results.append({"path": rel_f, "status": 500, "error": str(e)})
+        payload = json.dumps({"results": results}).encode()
+        self._head(200, len(payload), None, "application/json",
+                   {"Cache-Control": "no-store"})
+        self.end_headers()
+        self.wfile.write(payload)
+
     def _api_auth_state(self):
-        payload = json.dumps({"auth": self.store.auth_required()}).encode()
+        payload = json.dumps({
+            "auth": self.store.auth_required(),
+            "share_root": self._share_root() is not None,
+        }).encode()
         self._head(200, len(payload), None, "application/json",
                    {"Cache-Control": "no-store"})
         self.end_headers()
@@ -1319,6 +1454,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         norm = _norm(self.path).split("?")[0]
         length = int(self.headers.get("Content-Length") or -1)
+        if norm == "/__api/ingest":
+            if length <= 0 or length > 262144:
+                self._head(400, 0); self.end_headers(); return
+            self._api_ingest()
+            return
         if norm != "/__api/msg" or length <= 0 or length > 16384:
             self._head(400, 0); self.end_headers(); return
         try:
@@ -1822,49 +1962,6 @@ def render_board(rows, empty_hint="  (board is empty — post something)"):
                   f"{r['body']}")
 
 
-def board_prompt(store=None, fetch=None, send=None):
-    """Shared slim board loop: render tail → post / blank=refresh / q=back.
-    Local mode passes `store`; remote mode passes fetch(after)→dict and
-    send(text)→http-status. Returns exit code."""
-    try:
-        if store is not None:
-            all_rows = list(store.msgs_since(0, 500))
-        else:
-            all_rows = list(fetch(0).get("messages", []))
-        render_board(all_rows[-20:])
-        last = all_rows[-1]["id"] if all_rows else 0
-
-        while True:
-            try:
-                text = input(cyan("  post ❯ ")).strip()
-            except (EOFError, KeyboardInterrupt):
-                print(); return EXIT_OK
-            if text.lower() in ("q", "quit", "exit"):
-                return EXIT_OK
-            if not text:
-                if store is not None:
-                    fresh = list(store.msgs_since(last, 500))
-                else:
-                    fresh = list(fetch(last).get("messages", []))
-                if fresh:
-                    render_board(fresh)
-                    last = fresh[-1]["id"]
-                continue
-            if store is not None:
-                try:
-                    store.post_msg(_node_name(), "user", text)
-                except ValueError as e:
-                    print(red(f"  ✗ {e}")); continue
-            else:
-                st = send(text)
-                if st != 201:
-                    print(red(f"  ✗ post failed (HTTP {st})")); continue
-            print(dim("  ✓ posted"))
-    except RemoteError as e:
-        print(red(f"  ✗ {e}"))
-        return EXIT_NOMATCH
-
-
 def score_query(query, path):
     """Score one path against a query. Higher = better; 0 = no match."""
     q = query.lower().strip()
@@ -2267,6 +2364,34 @@ def multi_pick(rows):
 # Browse navigator — a tiny file manager over the raw-mode toolkit
 # ---------------------------------------------------------------------------
 
+def scan_dir(d, vault_suffixes=(".vault", ".vault-shm", ".vault-wal")):
+    """[(name, is_dir, size)] dirs-first, natural-sorted. Hidden entries,
+    __pycache__ and vault artifacts are skipped. Never raises."""
+    out = []
+    try:
+        for e in os.scandir(d):
+            if e.name.startswith(".") or e.name == "__pycache__":
+                continue
+            try:
+                is_dir = e.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if not is_dir and e.name.endswith(vault_suffixes):
+                continue
+            try:
+                size = 0 if is_dir else e.stat().st_size
+            except OSError:
+                continue
+            out.append((e.name, is_dir, size))
+    except OSError:
+        pass
+    dirs = sorted(((n, True, s) for n, is_d, s in out if is_d),
+                  key=lambda t: natural_key(t[0]))
+    files = sorted(((n, False, s) for n, is_d, s in out if not is_d),
+                   key=lambda t: natural_key(t[0]))
+    return dirs + files
+
+
 class BrowseState:
     """Pure-logic directory navigator (no I/O beyond directory listing).
     *root* is the navigation ceiling, *anchor* the starting dir (into-folder
@@ -2286,29 +2411,7 @@ class BrowseState:
     VAULT_SUFFIXES = (".vault", ".vault-shm", ".vault-wal")
 
     def _scan(self, d):
-        out = []
-        try:
-            for e in os.scandir(d):
-                if e.name.startswith(".") or e.name == "__pycache__":
-                    continue
-                try:
-                    is_dir = e.is_dir(follow_symlinks=False)
-                except OSError:
-                    continue
-                if not is_dir and e.name.endswith(self.VAULT_SUFFIXES):
-                    continue
-                try:
-                    size = 0 if is_dir else e.stat().st_size
-                except OSError:
-                    continue
-                out.append((e.name, is_dir, size))
-        except OSError:
-            pass
-        dirs = sorted(((n, True, s) for n, is_d, s in out if is_d),
-                      key=lambda t: natural_key(t[0]))
-        files = sorted(((n, False, s) for n, is_d, s in out if not is_d),
-                       key=lambda t: natural_key(t[0]))
-        return dirs + files
+        return scan_dir(d, self.VAULT_SUFFIXES)
 
     def _rel(self, abspath):
         return os.path.relpath(abspath, self.root).replace(os.sep, "/")
@@ -2407,6 +2510,111 @@ class BrowseState:
             rel = self._rel_anchor(abs_p) or os.path.basename(abs_p)
             out.append((abs_p, rel))
         return out
+
+
+class RemoteBrowseState(BrowseState):
+    """Navigator backed by a remote vault's --share-root listing.
+    Paths are virtual (share-root-absolute, leading '/')."""
+
+    def __init__(self, rv):
+        super().__init__("/", anchor="/")
+        self.rv = rv
+
+    def _scan(self, d):
+        import urllib.parse as up
+        data = self.rv._fetch(f"/__api/browse?dir={up.quote(d)}")
+        out = [(e["name"], e["is_dir"], e["size"])
+               for e in data.get("entries", [])]
+        dirs = sorted(((n, True, s) for n, is_d, s in out if is_d),
+                      key=lambda t: natural_key(t[0]))
+        files = sorted(((n, False, s) for n, is_d, s in out if not is_d),
+                       key=lambda t: natural_key(t[0]))
+        return dirs + files
+
+    def parent(self):
+        if self.cur != self.root:
+            self.cur = os.path.dirname(self.cur) or "/"
+            self.query = ""
+            self.sel = 0
+
+    def _subtree_files(self, abs_dir):
+        if abs_dir not in self._subtree_cache:
+            import urllib.parse as up
+            data = self.rv._fetch(
+                f"/__api/browse?dir={up.quote(abs_dir)}&recursive=1")
+            self._subtree_cache[abs_dir] = frozenset(
+                "/" + f["path"] for f in data.get("files", []))
+        return self._subtree_cache[abs_dir]
+
+    def confirm_items(self):
+        """[(virtual_path, relpath-to-anchor)] — virtual paths are sent
+        back to the server via POST /__api/ingest."""
+        anchor = self.anchor.rstrip("/")
+        out = []
+        for vp in sorted(self.checked, key=natural_key):
+            rel = vp[len(anchor):].lstrip("/") if vp.startswith(anchor) \
+                else os.path.basename(vp)
+            out.append((vp, rel))
+        return out
+
+
+def remote_browse_picker(rv):
+    """Navigator over a remote vault's share root. Returns
+    [(virtual_path, relpath)] or None."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()
+            and _termios_available()):
+        print(red("  ✗ remote browse needs an interactive terminal"))
+        return None
+    import termios
+    import tty
+    st = RemoteBrowseState(rv)
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\x1b[2J\x1b[H\x1b[?25l")
+        while True:
+            sys.stdout.write(_browse_render(st))
+            sys.stdout.flush()
+            key = _read_key(fd)
+            if key is None or key in ("esc", "\x1b", "\x03", "\x04"):
+                return None
+            n = len(st.entries())
+            if key == "up":
+                st.sel = max(0, st.sel - 1)
+            elif key == "down":
+                st.sel = min(max(n - 1, 0), st.sel + 1)
+            elif key == "right":
+                st.descend()
+            elif key == "left":
+                st.parent()
+            elif key in ("\r", "\n"):
+                e = st.current()
+                if e and e[1]:
+                    st.descend()
+                else:
+                    st.toggle()
+            elif key == " ":
+                st.toggle()
+            elif key in ("\x7f", "\b"):
+                if st.query:
+                    st.query = st.query[:-1]
+                    st.sel = 0
+                else:
+                    st.parent()
+            elif key == "a":
+                st.select_visible()
+            elif key == "u":
+                st.clear()
+            elif key == "s":
+                return st.confirm_items()
+            elif len(key) == 1 and key >= " ":
+                st.query += key
+                st.sel = 0
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\r\x1b[J\x1b[?25h")
+        sys.stdout.flush()
 
 
 def _parse_escape(seq):
@@ -2530,12 +2738,12 @@ def _browse_render(st):
 
 
 def browse_picker(start=None):
-    """Directory navigator starting at *start* (default cwd); `←` climbs
-    to the filesystem root. Returns [(abspath, relpath-to-start)] or None.
+    """Directory navigator locked to *start* (default cwd): `←` at the
+    start dir does nothing — you can descend into subdirectories but
+    never leave. Returns [(abspath, relpath-to-start)] or None.
 
-    Real terminal: full navigator (descend/ascend, subtree toggles,
-    live filter). Non-TTY: falls back to the flat multi-pick rooted at
-    *start*."""
+    Real terminal: full navigator on a clean screen (descend/ascend,
+    subtree toggles, live filter). Non-TTY: flat multi-pick fallback."""
     start = os.path.abspath(os.path.expanduser(start or os.getcwd()))
     if not os.path.isdir(start):
         return None
@@ -2552,17 +2760,17 @@ def browse_picker(start=None):
 
     import termios
     import tty
-    st = BrowseState(os.path.abspath(os.sep), anchor=start)
+    st = BrowseState(start, anchor=start)          # locked to start dir
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
         tty.setraw(fd)
-        sys.stdout.write("\x1b[?25l")
+        sys.stdout.write("\x1b[2J\x1b[H\x1b[?25l")   # clear slate, own screen
         while True:
             sys.stdout.write(_browse_render(st))
             sys.stdout.flush()
             key = _read_key(fd)
-            if key is None or key in ("esc", "\x03", "\x04"):
+            if key is None or key in ("esc", "\x1b", "\x03", "\x04"):
                 return None
             n = len(st.entries())
             if key == "up":
@@ -2638,6 +2846,182 @@ def _live_search_fallback(rows, player_label="watch", multi=False):
         if raw.isdigit() and 1 <= int(raw) <= min(len(matches), 12):
             return [matches[int(raw) - 1]]
         return matches
+
+
+def _board_render(view, buffer_text, anchor_label):
+    """Board frame: live_search protocol (\r-led, \x1b[K, cursor-up)."""
+    def line(s=""):
+        return "\r" + s + "\x1b[K"
+    lines = ["\x1b[J" + line(f"  board ❯ {anchor_label}"
+                              + dim(f"   {len(view)} messages"
+                                    + " · live"))]
+    for r in view[-18:]:
+        ts = str(r.get("ts", ""))[5:16]
+        if r.get("kind") == "system":
+            lines.append(line(dim(f"  · [{ts}] {r['body']}")))
+        else:
+            lines.append(line(f"  {cyan(str(r.get('sender', '?')))} "
+                              + dim(f"[{ts}]  ") + r["body"]))
+    lines.append(line(""))
+    lines.append(line(f"  {cyan('post ❯')} {buffer_text}█   "
+                      + dim("(enter=send · esc=back)")))
+    return "\n".join(lines) + f"\r\x1b[{len(lines)}A"
+
+
+def _tty_ok():
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty() \
+            and _termios_available()
+    except Exception:
+        return False
+
+
+def board_live(store=None, fetch=None, send=None, read_key=None,
+               poll=1.5, label="board", assume_tty=False):
+    """Real-time board (TTY): messages stream in via a poll loop while
+    you type; Enter posts the line buffer, Esc/q exits. Falls back to
+    board_prompt() when stdin isn't a real terminal. Tests inject
+    read_key (a zero-arg callable) and skip the select gate."""
+    interactive = read_key is None
+    if not assume_tty and not (_tty_ok() and interactive):
+        return board_prompt(store=store, fetch=fetch, send=send)
+
+    def load(after):
+        if store is not None:
+            return [dict(r) for r in store.msgs_since(after, 500)]
+        data = fetch(after)
+        return list(data.get("messages", []))
+
+    def post(text):
+        if store is not None:
+            store.post_msg(_node_name(), "user", text)
+            return True
+        return send(text) == 201
+
+    import termios
+    import tty
+    view, last = [], 0
+    try:
+        first = load(0)
+        view = first[-20:]
+        last = first[-1]["id"] if first else 0
+    except Exception as e:
+        print(red(f"  ✗ board: {e}"))
+        return EXIT_NOMATCH
+
+    buf = ""
+    fd = None
+    old = None
+    if interactive:
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setraw(fd)
+    last_poll = 0.0
+
+    def drain_and_render():
+        try:
+            fresh = load(last)
+            for m in fresh:
+                view.append(m)
+                last = m["id"]
+        except Exception:
+            pass
+        sys.stdout.write(_board_render(view[-20:], buf, label))
+        sys.stdout.flush()
+
+    try:
+        if interactive:
+            sys.stdout.write("\x1b[2J\x1b[H\x1b[?25l")
+        import time as _t
+        last_poll = _t.perf_counter()
+        drain_and_render()
+        while True:
+            now = _t.perf_counter()
+            fired = now - last_poll >= poll
+            if fired:
+                last_poll = now
+                drain_and_render()
+            if interactive:
+                r, _, _ = select.select([fd], [], [], 0.2)
+                if not r:
+                    continue
+            key = read_key()
+            if key is None or key in ("esc", "\x1b", "\x03", "\x04"):
+                break
+            if key in ("\r", "\n"):
+                if buf.strip():
+                    try:
+                        if post(buf.strip()):
+                            drain_and_render()
+                        buf = ""
+                    except ValueError as e:
+                        print("\r" + red(f"  ✗ {e}"))
+                        buf = ""
+                else:
+                    drain_and_render()
+                if interactive:
+                    drain_and_render()
+                continue
+            if key == "\x7f":
+                buf = buf[:-1]
+            elif len(key) == 1 and key >= " ":
+                buf += key
+                if len(buf) > 2000:
+                    buf = buf[:2000]
+            drain_and_render()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if fd is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\r\x1b[J\x1b[?25h")
+        sys.stdout.flush()
+    return EXIT_OK
+
+
+def board_prompt(store=None, fetch=None, send=None):
+    """Board entry: real-time raw view on TTYs, refresh-on-Enter loop
+    for pipes. Local mode passes `store`; remote passes fetch/send."""
+    if sys.stdin.isatty() and sys.stdout.isatty() and _termios_available():
+        return board_live(store=store, fetch=fetch, send=send)
+    # ---- fallback: refresh-on-Enter (unchanged) --------------------------
+    try:
+        if store is not None:
+            all_rows = list(store.msgs_since(0, 500))
+        else:
+            all_rows = list(fetch(0).get("messages", []))
+        render_board(all_rows[-20:])
+        last = all_rows[-1]["id"] if all_rows else 0
+
+        while True:
+            try:
+                text = input(cyan("  post ❯ ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print(); return EXIT_OK
+            if text.lower() in ("q", "quit", "exit"):
+                return EXIT_OK
+            if not text:
+                if store is not None:
+                    fresh = list(store.msgs_since(last, 500))
+                else:
+                    fresh = list(fetch(last).get("messages", []))
+                if fresh:
+                    render_board(fresh)
+                    last = fresh[-1]["id"]
+                continue
+            if store is not None:
+                try:
+                    store.post_msg(_node_name(), "user", text)
+                except ValueError as e:
+                    print(red(f"  ✗ {e}")); continue
+            else:
+                st = send(text)
+                if st != 201:
+                    print(red(f"  ✗ post failed (HTTP {st})")); continue
+            print(dim("  ✓ posted"))
+    except RemoteError as e:
+        print(red(f"  ✗ {e}"))
+        return EXIT_NOMATCH
 
 
 def choose_match(matches, prompt="choose"):
@@ -3327,6 +3711,14 @@ class RemoteVault:
                                                    safe="") + "@", 1)
         return url
 
+    def share_root_available(self):
+        """Authed probe: does the remote vault expose --share-root?"""
+        try:
+            data = self._fetch("/__api/auth")
+            return bool(data.get("share_root"))
+        except Exception:
+            return False
+
     def store_requires_auth(self):
         """Probe the vault once without credentials: 401 ⇒ gated.
         Cached for the connection's lifetime."""
@@ -3411,6 +3803,20 @@ class RemoteVault:
             return EXIT_NOMATCH
         finally:
             conn.close()
+
+
+def store_note_remote(rv, text):
+    """Best-effort system post to the remote vault's board."""
+    try:
+        conn = http.client.HTTPConnection(rv.host, rv.port, timeout=15)
+        conn.request("POST", "/__api/msg",
+                     body=json.dumps({"body": text}),
+                     headers={**rv._headers(),
+                              "Content-Type": "application/json",
+                              "X-Smv-Name": _node_name()})
+        conn.getresponse().read(); conn.close()
+    except Exception:
+        pass
 
 
 def _ensure_rows(rv):
@@ -3772,6 +4178,48 @@ def run_client(spec, player=None):
                                  "\n  ❯ ").strip()
                     if not line:
                         continue
+                    if line.lower() in ("b", "browse") \
+                            and rv.share_root_available():
+                        picked = remote_browse_picker(rv)
+                        if not picked:
+                            print(yellow("  (nothing selected)"))
+                            continue
+                        into = input(dim("  into folder? [/]") + " ") \
+                            .strip() or "/"
+                        conn = http.client.HTTPConnection(
+                            rv.host, rv.port, timeout=1800)
+                        try:
+                            conn.request(
+                                "POST", "/__api/ingest",
+                                body=json.dumps(
+                                    {"paths": [p for p, _ in picked],
+                                     "into": into}),
+                                headers={**rv._headers(),
+                                         "Content-Type":
+                                             "application/json"})
+                            resp = conn.getresponse()
+                            results = json.loads(resp.read())
+                        finally:
+                            conn.close()
+                        sealed = failed = 0
+                        for rr_ in results.get("results", []):
+                            if rr_["status"] == 201:
+                                sealed += 1
+                                print(green(f"  ✓ sealed on server: "
+                                            f"{rr_.get('dest', rr_['path'])}"))
+                            elif rr_["status"] == 409:
+                                print(yellow(f"  = already sealed: "
+                                             f"{rr_['path']}"))
+                            else:
+                                failed += 1
+                                print(red(f"  ✗ {rr_['path']}: "
+                                          f"HTTP {rr_['status']}"))
+                        rv.rows = None
+                        if sealed:
+                            store_note_remote(rv, sealed, into)
+                        if failed:
+                            print(red(f"  ── {failed} failed"))
+                        continue
                     if line.lower() in ("b", "browse"):
                         picked = browse_picker()
                         if not picked:
@@ -3876,6 +4324,10 @@ def build_parser():
     ap.add_argument("-i", "--wizard", action="store_true",
                     help="force the interactive wizard (even with a vault)")
     ap.add_argument("--name", help="node name on the message board (default: hostname or $SMOLVAULT_NAME)")
+    ap.add_argument("--share-root", metavar="DIR",
+                    help="serve/wizard: expose DIR to password-holding "
+                         "clients for remote browse + ingest (off by "
+                         "default; paths are traversal-locked to DIR)")
     ap.add_argument("--no-discover", action="store_true",
                     help="do not answer LAN discovery probes")
 
@@ -3935,7 +4387,9 @@ def main(argv=None):
         print(green(f"  ✓ network auth {'required' if args.auth == 'on' else 'disabled'}"
                     + (" (files stay encrypted at rest)"
                        if st_.enc_enabled() else "")))
-        return EXIT_OK
+        if not args.serve:
+            return EXIT_OK
+        print(dim("  · serving with the new setting"))
 
     # ---- at-rest encryption -------------------------------------------
     if args.encrypt or args.decrypt:
@@ -4006,7 +4460,9 @@ def main(argv=None):
             bar.finish()
             print(green(f"  ✓ vault {'encrypted' if args.encrypt else 'decrypted'}"
                         f" · {n_all} chunk(s) rewritten"))
-            return EXIT_OK
+            if not args.serve:
+                return EXIT_OK
+            print(dim("  · serving with the new setting"))
         except LockedVault as e:
             print(red(f"  ✗ {e}"))
             return EXIT_NOMATCH
@@ -4027,6 +4483,14 @@ def main(argv=None):
         elif not store.check_password(args.password):
             print(red("incorrect password"))
             return EXIT_NOMATCH
+
+    if args.share_root:
+        sr = os.path.abspath(os.path.expanduser(args.share_root))
+        if not os.path.isdir(sr):
+            print(red(f"  ✗ share root is not a directory: {sr}"))
+            return EXIT_NOMATCH
+        store.cfg_set("share_root", sr)
+        print(green(f"  ✓ share root exposed to clients: {sr}"))
 
     action_flags = any([args.add, args.list, args.du, args.search,
                         args.play, args.info, args.get])

@@ -132,7 +132,10 @@ class TestWiring(BrowseTestBase):
 
     def test_browse_picker_cancel_returns_none(self):
         # non-TTY: multi_pick falls back to input() -> EOF -> None
-        picked = sv.browse_picker(self.videos)
+        import builtins
+        with mock.patch.object(builtins, "input",
+                               lambda p="": (_ for _ in ()).throw(EOFError)):
+            picked = sv.browse_picker(self.videos)
         self.assertIsNone(picked)
 
 
@@ -198,3 +201,40 @@ class TestParseEscape(unittest.TestCase):
     def test_no_bracket_leak(self):
         for seq in ("\x1b[C", "\x1bOC", "\x1b[1;5C", "\x1b[Z", "\x1b[999~"):
             self.assertNotIn("[", sv._parse_escape(seq))
+
+
+class TestBoardLive(BrowseTestBase):
+    def test_live_poll_and_post(self):
+        import builtins
+        store = sv.Store(os.path.join(self.W, "b.vault"))
+        store.post_msg("alice", "user", "first message")
+
+        # scripted keys: type "hi", Enter (posts), then Esc repeats -> exit
+        import itertools
+        keys = itertools.chain(list("hi") + ["\r"],
+                               itertools.repeat("\x1b"))
+        with mock.patch.object(builtins, "input", lambda p="": (_ for _ in ()).throw(
+                AssertionError("fallback must not run"))):
+            buf = io.StringIO()
+            from contextlib import redirect_stdout
+            with redirect_stdout(buf):
+                rc = sv.board_live(store=store, poll=60,
+                                   read_key=lambda: next(keys),
+                                   assume_tty=True)
+
+        self.assertEqual(rc, sv.EXIT_OK)
+        msgs = [m["body"] for m in store.msgs_since(0)]
+        self.assertIn("first message", msgs)
+        self.assertIn("hi", msgs)          # posted from the live editor
+
+    def test_fallback_on_non_tty(self):
+        # non-TTY: board_live delegates to the refresh loop (EOF exits)
+        import builtins
+        real = builtins.input
+        builtins.input = lambda p="": (_ for _ in ()).throw(EOFError)
+        try:
+            rc = sv.board_live(store=None, fetch=lambda a: {"messages": []},
+                               send=lambda t: 201)
+        finally:
+            builtins.input = real
+        self.assertEqual(rc, sv.EXIT_OK)

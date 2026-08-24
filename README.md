@@ -3,7 +3,7 @@
 [![python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
 [![dependencies](https://img.shields.io/badge/dependencies-zero-success)](#requirements)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-![version](https://img.shields.io/badge/version-0.2.5-lightgrey)
+![version](https://img.shields.io/badge/version-0.3.0-lightgrey)
 
 **smolvault is an immutable, content-addressed vault for everything you have —
 that speaks just enough HTTP to be mistaken for a local disk.**
@@ -46,12 +46,13 @@ Press `a`, drag any files from your file manager into the terminal, Enter:
 ```
 
 Point it at a folder to ingest a whole tree — or `[b]` to open the
-**browse navigator**: a tiny file manager starting at your current
-directory. `↑↓` move · `→` descend · `←` climbs up · Space toggles
-(on a folder = its whole subtree, `◐ n/m` while partial) · `a`
-select-all · live filter · `s` seals the selection. Vault internals
-(`*.vault`, `__pycache__`) never appear. Then press `p` and start
-typing — results filter as you type:
+**browse navigator**: a tiny file manager that takes over the screen,
+starting at your current directory and **locked to it** (you can
+descend into subdirectories, never climb out). `↑↓` move · `→` descend
+· `←` up · Space toggles (on a folder = its whole subtree, `◐ n/m`
+while partial) · `a` select-all · live filter · `s` seals. Vault
+internals (`*.vault`, `__pycache__`) never appear. Then press `p` and
+start typing — results filter as you type:
 
 ```
   watch ❯ dune · 2
@@ -110,6 +111,9 @@ After each action the hub collapses to a one-line prompt —
   (`s01/e1.mkv → /movies/s01/e1.mkv`), with a live Space-toggle multi-picker.
 - **Vault sync** — additive gap-filling replication between instances;
   nothing ever deleted, safe on a schedule.
+- **Remote ingest (opt-in)** — run the server with `--share-root DIR`
+  and password-holding clients can browse that directory remotely and
+  seal server-local files into the vault (traversal-locked, additive).
 - **Space insight** — `--du` breaks storage down by folder and surfaces
   byte-identical files sealed under different paths (WORM keeps them all,
   so knowing matters).
@@ -119,9 +123,10 @@ After each action the hub collapses to a one-line prompt —
 - **At-rest encryption (opt-in)** — every chunk sealed with AES-256-GCM
   via the system's OpenSSL; key derived from your vault password
   (scrypt). Zero PyPI dependencies. Dedup fully preserved.
-- **Message board** — each vault carries a small public board (MMO-style):
-  clients and the server post notes and system events (`sealed 12 files`,
-  `sync pushed X`). Long-poll-free by design: press `m`, read, post.
+- **Message board, live** — each vault carries a small public board
+  (MMO-style): clients and the server post notes and system events
+  (`sealed 12 files`, `sync pushed X`). Press `m`: new messages stream
+  in as they arrive while you type.
 - **Optional password** — PBKDF2-HMAC-SHA256 over HTTP Basic; doubles as
   the encryption key wrapper, and the network gate it controls is an
   independent switch (`--auth on|off`) so trusted LANs can stream freely.
@@ -235,6 +240,7 @@ No config files — flags and environment only.
 | `--encrypt` / `--decrypt` | toggle at-rest encryption in place (resumable) |
 | `--name NAME` | node name on the message board (default hostname) |
 | `--auth on\|off` | require the vault password over HTTP — **independent of encryption**: `off` keeps files sealed at rest while streaming openly on trusted LANs |
+| `--share-root DIR` | expose DIR to password-holding clients for remote browse + ingest (traversal-locked; off by default) |
 | `--check` / `--gc` | verify all chunks / reclaim orphaned chunks |
 
 ### HTTP API
@@ -247,6 +253,8 @@ No config files — flags and environment only.
 | `GET /__api/list` | JSON listing (path, size, mime, created_at, root_hash) |
 | `POST /__api/msg` | post to the vault's message board `{"body": …}` → 201 |
 | `GET /__api/msg?since=N` | board messages after id N |
+| `GET /__api/browse?dir=` | listing under `--share-root` (403 when off / escaping) |
+| `POST /__api/ingest` | seal server-local files `{paths, into}` (WORM, traversal-locked) |
 | `GET /__api/auth` | `{"auth": bool}` — whether the password gate is on |
 
 Auth (if set): HTTP Basic, PBKDF2-HMAC-SHA256, 100k iterations.
@@ -349,6 +357,9 @@ Passphrase strength matters: the key is only as strong as the password
 wrapping it (scrypt, n=2¹⁵). Password changes re-wrap the master key in
 milliseconds — data is never re-encrypted. The message board is visible
 to anyone holding the vault password and is not replicated by sync.
+`--share-root` grants password holders read+seal access to that one
+directory (traversal-locked, additive-only) — point it at a downloads
+folder, never at `/`.
 
 ## Design notes
 smolvault is the distilled successor of DenseVault.
