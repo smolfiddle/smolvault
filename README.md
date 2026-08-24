@@ -257,7 +257,7 @@ Loopback · NVMe · 6 cores ([full sheet](BENCHMARKS.md), reproduce with
 | Ingest (700 MB seal) | ~20–24 s (~29–35 MB/s) — media scans a hot stride |
 | Dedup | identical content → **+0 bytes**; WORM reject < 1 ms |
 | Full read 700 MB | **~150 MB/s** hash-verified |
-| Concurrent reads | **230–500 MB/s** aggregate |
+| Concurrent reads | **230–533 MB/s** aggregate |
 | Range read p50/p95 | **~5 ms / 12 ms** (256 KB, keep-alive) |
 | Playback vs local disk | startup ≈+0.2 s · deep seek ≈+0.0–0.1 s |
 | Vault sync | push @ **13–17 MB/s** · no-op re-sync **< 20 ms** |
