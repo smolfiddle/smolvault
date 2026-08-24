@@ -2946,6 +2946,8 @@ def board_live(store=None, fetch=None, send=None, read_key=None,
                 if not r:
                     continue
             key = read_key()
+            if key == "tick":
+                continue
             if key is None or key in ("esc", "\x1b", "\x03", "\x04"):
                 break
             if key in ("\r", "\n"):

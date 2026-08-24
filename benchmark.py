@@ -717,6 +717,103 @@ else:
     rec("board", "post + read-back roundtrip",
         f"{(time.perf_counter()-t0)*1000:.2f} ms")
 
+# ------------------------------------------------------- remote ingest
+hr("REMOTE INGEST (--share-root: client queues, server seals)")
+if hasattr(sv.Store, "enable_encryption") or True:
+    share_dir = os.path.join(W, "sharedir")
+    os.makedirs(share_dir)
+    share_payload = os.urandom(96 * 1024 * 1024)
+    open(os.path.join(share_dir, "clip.bin"), "wb").write(share_payload)
+    os.makedirs(os.path.join(share_dir, "batch"))
+    for i in range(20):
+        open(os.path.join(share_dir, "batch", f"p{i:02}.bin"), "wb") \
+            .write(os.urandom(1024 * 512))
+
+    RI_PORT = free_port(PORT + 5)
+    ri_srv = subprocess.Popen(
+        [sys.executable, "-u", SMOL, VAULT, "--serve",
+         "--host", "127.0.0.1", "--port", str(RI_PORT),
+         "--share-root", share_dir],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    up = False
+    end = time.time() + 15
+    while time.time() < end:
+        try:
+            cc = http.client.HTTPConnection("127.0.0.1", RI_PORT, timeout=1)
+            cc.request("OPTIONS", "/"); cc.getresponse().read(); cc.close()
+            up = True; break
+        except OSError:
+            time.sleep(0.2)
+
+    if up:
+        def riget(path):
+            cc = http.client.HTTPConnection("127.0.0.1", RI_PORT, timeout=30)
+            cc.request("GET", path)
+            r = cc.getresponse()
+            body = r.read(); cc.close()
+            return r.status, (json.loads(body) if body[:1] == b"{" else {})
+
+        def ripost(path, obj):
+            cc = http.client.HTTPConnection("127.0.0.1", RI_PORT, timeout=300)
+            cc.request("POST", path, body=json.dumps(obj).encode(),
+                       headers={"Content-Type": "application/json"})
+            r = cc.getresponse()
+            out = json.loads(r.read()); cc.close()
+            return r.status, out
+
+        st, data = riget("/__api/browse?dir=/")
+        t0 = time.perf_counter()
+        for _ in range(20):
+            riget("/__api/browse?dir=/")
+        dt = (time.perf_counter() - t0) / 20 * 1000
+        rec("share", "browse listing latency (root, 2 entries)",
+            f"{st} · p50 {dt:.1f} ms")
+
+        st, _ = riget("/__api/browse?dir=/../")
+        check403 = (st == 403)
+        st2, _ = riget("/__api/browse?dir=/../../etc")
+        rec("share", "traversal attempts (../ and deep)",
+            f"403/403 blocked" if check403 and st2 == 403
+            else f"{st}/{st2} — CHECK")
+
+        t0 = time.perf_counter()
+        st, out = ripost("/__api/ingest",
+                         {"paths": ["/clip.bin"], "into": "/remote"})
+        dt = time.perf_counter() - t0
+        st201 = [x for x in out["results"] if x["status"] == 201]
+        rec("share", f"remote ingest 96 MB (client queues, server seals)",
+            f"{st} · {dt:.2f}s · {96/dt:.1f} MB/s server-side "
+            f"({len(st201)} sealed)")
+
+        t0 = time.perf_counter()
+        paths = [f"/batch/p{i:02}.bin" for i in range(20)]
+        st, out = ripost("/__api/ingest", {"paths": paths, "into": "/remote"})
+        dt = time.perf_counter() - t0
+        n201 = sum(1 for x in out["results"] if x["status"] == 201)
+        rec("share", f"batch ingest 20 × 512 KB in one POST",
+            f"{n201}/20 sealed · {dt*1000:.0f} ms")
+
+        st, _ = riget("/__api/list")
+        rows_ = st and json.loads(open(os.path.join(W, "x"), "rb").read()) \
+            if False else None
+        cc = http.client.HTTPConnection("127.0.0.1", RI_PORT, timeout=30)
+        cc.request("GET", "/__api/list")
+        r = cc.getresponse()
+        vault_paths = {x["path"] for x in json.loads(r.read())}
+        cc.close()
+        check_ok = ("/remote/clip.bin" in vault_paths
+                    and "/remote/batch/p00.bin" in vault_paths)
+        rec("share", "ingested files in vault", "OK" if check_ok else "MISSING")
+
+        # traversal on ingest
+        st, out = ripost("/__api/ingest",
+                         {"paths": ["/../../../etc/passwd"], "into": "/"})
+        rec("share", "ingest traversal → blocked",
+            f"{out['results'][0]['status']} (expect 403/404)")
+    else:
+        rec("share", "skipped", "server failed to boot")
+    ri_srv.terminate()
+
 # ------------------------------------------------------------- lowmem box
 def _unit_peak_mb(unit):
     """Peak memory (MB) of a transient user scope, read while it lives."""
