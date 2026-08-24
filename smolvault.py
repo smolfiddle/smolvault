@@ -2279,14 +2279,21 @@ class BrowseState:
         self._subtree_cache = {}
 
     # -- listing ----------------------------------------------------------
+    VAULT_SUFFIXES = (".vault", ".vault-shm", ".vault-wal")
+
     def _scan(self, d):
         out = []
         try:
             for e in os.scandir(d):
-                if e.name.startswith("."):
+                if e.name.startswith(".") or e.name == "__pycache__":
                     continue
                 try:
                     is_dir = e.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                if not is_dir and e.name.endswith(self.VAULT_SUFFIXES):
+                    continue
+                try:
                     size = 0 if is_dir else e.stat().st_size
                 except OSError:
                     continue
@@ -2399,6 +2406,12 @@ class BrowseState:
 
 
 def _browse_render(st):
+    """Frame in the live_search protocol: every line \r-prefixed and
+    \x1b[K-terminated, frame ends by cursor-up so repaints stay put."""
+
+    def line(s=""):
+        return "\r" + s + "\x1b[K"
+
     rel = os.path.relpath(st.cur, st.anchor)
     head = "  add ❯ " + ("/" if rel == "." else
                          (f"/{rel}" if not rel.startswith("..")
@@ -2416,7 +2429,10 @@ def _browse_render(st):
                     full += 1
                 elif mk[0]:
                     partial += 1
-    counts = dim(f"   ✓{len(st.checked)}")
+
+    counts = ""
+    if st.checked:
+        counts += green(f"   ✓{len(st.checked)}")
     if partial:
         counts += yellow(f" · ◐{partial}")
     if full:
@@ -2424,10 +2440,12 @@ def _browse_render(st):
     counts += dim(f"   {len(es)} shown")
 
     B = "─" * 66
-    lines = [head + counts, dim("  " + B)]
-    lo = max(0, min(st.sel - 6, len(es) - 12))
-    for i, (name, is_dir, size, r) in enumerate(es[lo:lo + 12], lo):
-        cursor = "  ❯ " if i == st.sel else "    "
+    lines = [line(head + counts), line(dim("  " + B))]
+    lo = max(0, min(st.sel - 6, max(len(es) - 12, 0)))
+    window = es[lo:lo + 12]
+    for i, (name, is_dir, size, r) in enumerate(window, lo):
+        cursor = " ❯ " if i == st.sel else "   "
+        tick = green("✓") if r in st.checked else " "
         if is_dir:
             mk = st.dir_marker(r)
             if mk:
@@ -2436,17 +2454,18 @@ def _browse_render(st):
                         else (yellow(f"◐ {sel_n}/{tot_n}") if sel_n
                               else dim(f"○ {tot_n}")))
             else:
-                mark = dim("empty")
-            pad = " " * max(1, 40 - len(name))
-            lines.append(f"{cursor}{cyan(name + '/')}{pad}{mark}")
+                mark = dim("   empty")
+            name_col = cyan(name + "/")
         else:
-            tick = green("✓ ") if r in st.checked else "  "
-            lines.append(f"{cursor}{tick}{name}"
-                         + dim(f"   {fmt(size)}"))
-    lines.append(dim("  " + B))
-    lines.append(dim("  → open · ← up · space ✓ · a all · u none · "
-                     "s seal ✓" + str(len(st.checked)) + " · esc"))
-    return "\n".join(lines) + "\r"
+            mark = dim(fmt(size).rjust(10))
+            name_col = tick + " " + name
+        lines.append(line(f" {cursor} {name_col:<40}{mark}"))
+    lines.append(line(dim("  " + B)))
+    foot = "  → open · ← up · space ✓ · a all · u none"
+    foot += dim(" · s seal " + (f"✓{len(st.checked)}" if st.checked
+                                else "") + " · esc")
+    lines.append(line(foot))
+    return "\n".join(lines) + f"\r\x1b[{len(lines)}A"
 
 
 def browse_picker(start=None):
