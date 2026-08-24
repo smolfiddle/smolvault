@@ -15,6 +15,8 @@ seeking. Media is the headline act; documents, archives and disk images are
 equal citizens.
 
 ```bash
+git clone https://github.com/smolfiddle/smolvault.git
+cd smolvault
 python3 smolvault.py        # that's the whole install
 ```
 
