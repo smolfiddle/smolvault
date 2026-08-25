@@ -1867,7 +1867,7 @@ def ingest_plan_ok(items, into, asker):
     if len(items) <= PLAN_FILES and total <= PLAN_BYTES:
         return True
     try:
-        return asker("  proceed? [y/N]: ").strip().lower() == "y"
+        return asker("  proceed? [Y/n]: ").strip().lower() in ("", "y", "yes")
     except (EOFError, KeyboardInterrupt):
         return False
 
@@ -3194,10 +3194,10 @@ def play_query(store, query, player=None, password=None):
         print(yellow(f"  '{path}' is {mime} — not watchable."))
         if sys.stdin.isatty():
             try:
-                ans = input(cyan("  export a copy instead? [y/N]: ")).strip().lower()
+                ans = input(cyan("  export a copy instead? [Y/n]: ")).strip().lower()
             except (EOFError, KeyboardInterrupt):
                 ans = ""
-            if ans == "y":
+            if ans in ("", "y", "yes"):
                 return export_file(store, path)
         else:
             print(dim("  (use --get to export it)"))
@@ -3596,11 +3596,11 @@ class Wizard:
                     if sys.stdin.isatty():
                         try:
                             ans = input(cyan(
-                                "  encrypt vault at rest? [y/N]: "
+                                "  encrypt vault at rest? [Y/n]: "
                             )).strip().lower()
                         except (EOFError, KeyboardInterrupt):
                             ans = ""
-                        if ans == "y":
+                        if ans in ("", "y", "yes"):
                             self.store.enable_encryption(pwd)
                             self.pw = pwd
                             n = self.store.migrate_encryption()
@@ -4112,10 +4112,10 @@ def sync_vault(store, direction, host, port, assume_yes=False):
 
     if not assume_yes:
         try:
-            ans = input(cyan("  proceed? [y/N]: ")).strip().lower()
+            ans = input(cyan("  proceed? [Y/n]: ")).strip().lower()
         except (EOFError, KeyboardInterrupt):
             ans = ""
-        if ans != "y":
+        if ans not in ("", "y", "yes"):
             print(yellow("  cancelled"))
             return EXIT_OK
 
