@@ -3,7 +3,7 @@
 [![python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
 [![dependencies](https://img.shields.io/badge/dependencies-zero-success)](#requirements)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-![version](https://img.shields.io/badge/version-0.3.2-lightgrey)
+![version](https://img.shields.io/badge/version-0.3.3-lightgrey)
 
 **smolvault is an immutable, content-addressed vault for everything you have —
 that speaks just enough HTTP to be mistaken for a local disk.**
@@ -70,7 +70,7 @@ phone and the same library streams there.
 
 ```
   ┌────────────────────────────────────────────────────────┐
-    smolvault 0.3.2
+    smolvault 0.3.3
      vault    vault.vault · 12 files · 22.3 GB logical · 11 GB stored
     local    http://127.0.0.1:8100/
     network  http://192.168.1.14:8100/   ● running   ← phone/TV ready
@@ -79,15 +79,16 @@ phone and the same library streams there.
 
     a add       drop files · path · [b]rowse a folder
     s search    find something
-    p play      live search → mpv        (w works too)
-    l library   browse everything (paged)
+    p play      search → mpv (w) · [b]rowse vault
+    l library   browse everything · [b]vault browser
     d du        space by folder · find double-sealed files
     m board     this vault's messages · clients & server post here
-    i info      details about a file
-    g get       export a copy out of the vault
-    c copy      stream link → clipboard
+    i info      details about a file · [b]browse
+    g get       export a copy · [b]browse vault
+    c copy      stream link → clipboard · [b]browse vault
     y sync      mirror another smolvault
     S server    start/stop network sharing
+    P port      change port
     v verify    check every chunk's hash
     q quit
 ```
@@ -132,6 +133,8 @@ After each action the hub collapses to a one-line prompt —
 - **Optional password** — PBKDF2-HMAC-SHA256 over HTTP Basic; doubles as
   the encryption key wrapper, and the network gate it controls is an
   independent switch (`--auth on|off`) so trusted LANs can stream freely.
+- **Port picker at vault creation** — `port [8100]` (Enter=auto next free) via `prompt_for_port`, persisted per-vault; change anytime with `P` in wizard or `--port` / `$SMOLVAULT_PORT`.
+- **Tiny vault file manager** — `[b]rowse vault` in `play`/`get`/`library`/`info`/`copy` (and remote `watch`/`get`) — same raw-mode keys (`↑↓ → ← Enter i info`), live filter, backed by `VaultBrowseState` (prefix tree from `Store.list_dir`).
 
 ## Requirements
 
@@ -148,6 +151,9 @@ After each action the hub collapses to a one-line prompt —
 
 ```bash
 python3 smolvault.py                    # hub, as shown above
+# on first vault creation you'll be asked: port [8100] (Enter=auto next free)
+# or set upfront: python3 smolvault.py my.vault --port 9000
+# or env: SMOLVAULT_PORT=9000 python3 smolvault.py
 ```
 
 ### Sealing from scripts
@@ -230,6 +236,7 @@ No config files — flags and environment only.
 | `SMOLVAULT_SERVER` | default `host:port` for client mode |
 | `SMOLVAULT_DEBUG` | verbose debug output + SIGUSR1 stack dumps |
 | `SMOLVAULT_NAME` | node name on the message board (else hostname) |
+| `SMOLVAULT_PORT` | default port at vault creation (else auto next free) |
 | `NO_COLOR` | disable ANSI color everywhere |
 
 | Flag | Effect |
