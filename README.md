@@ -3,7 +3,7 @@
 [![python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
 [![dependencies](https://img.shields.io/badge/dependencies-zero-success)](#requirements)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-![version](https://img.shields.io/badge/version-0.3.1-lightgrey)
+![version](https://img.shields.io/badge/version-0.3.2-lightgrey)
 
 **smolvault is an immutable, content-addressed vault for everything you have —
 that speaks just enough HTTP to be mistaken for a local disk.**
@@ -70,8 +70,8 @@ phone and the same library streams there.
 
 ```
   ┌────────────────────────────────────────────────────────┐
-    smolvault 0.3.1
-    vault    vault.vault · 12 files · 22.3 GB logical · 11 GB stored
+    smolvault 0.3.2
+     vault    vault.vault · 12 files · 22.3 GB logical · 11 GB stored
     local    http://127.0.0.1:8100/
     network  http://192.168.1.14:8100/   ● running   ← phone/TV ready
     auth     password protected · AES-256-GCM at rest
@@ -235,29 +235,40 @@ No config files — flags and environment only.
 | Flag | Effect |
 |---|---|
 | `--serve` | plain server mode (no wizard) |
-| `--host` / `--port` | bind address (default `127.0.0.1`:8100, remembered per-vault) |
-| `-p/--password` | set/verify vault password |
+| `--host` / `--port` | bind address (default `127.0.0.1`:8100, remembered per-vault; `--port` validated 1-65535) |
+| `-p/--password` | set/verify vault password (also unlocks encrypted vault) |
+| `-v/--verbose` | verbose logging |
+| `-i/--wizard` | force the interactive wizard (even with a vault) |
+| `--no-discover` | do not answer LAN discovery probes |
+| `--connect [HOST[:PORT]]` | client mode: `auto` discovers LAN, or `SMOLVAULT_SERVER` |
 | `--add PATH… [--into DIR]` | seal files/folders (folders walk recursively) |
+| `--list` | print library table |
+| `--search Q` | search the library |
+| `--play Q [--player BIN]` | search + play in mpv |
+| `--info PATH_OR_Q` | file details |
+| `--get PATH_OR_Q [-o FILE]` | export a file |
 | `--du` | space by folder + byte-identical duplicate report |
 | `--encrypt` / `--decrypt` | toggle at-rest encryption in place (resumable) |
-| `--name NAME` | node name on the message board (default hostname) |
+| `--name NAME` | node name on the message board (default hostname / `$SMOLVAULT_NAME`) |
 | `--auth on\|off` | require the vault password over HTTP — **independent of encryption**: `off` keeps files sealed at rest while streaming openly on trusted LANs |
-| `--share-root DIR` | expose DIR to password-holding clients for remote browse + ingest (traversal-locked; off by default) |
-| `--check` / `--gc` | verify all chunks / reclaim orphaned chunks |
+| `--share-root DIR` | expose DIR to password-holding clients for remote browse + ingest (traversal-locked, symlink-blocked, additive; **persisted** in vault config — re-run without flag stays exposed) |
+| `--check` / `--gc` | verify all chunks (`--check` needs vault) / reclaim orphaned chunks (locked, `VACUUM` under write lock) |
+| `--sync-to HOST` / `--sync-from HOST` | push/pull additive gap-filling sync (hash/size verified) |
 
 ### HTTP API
 
 | Endpoint | Behaviour |
 |---|---|
-| `GET/HEAD /path` | full file or RFC 7233 range; ETag/304 revalidation |
-| `PUT /path` | seal a new file (`409` if path exists — WORM) |
+| `GET/HEAD /path` | full file or RFC 7233 range; canonical path (resolves `..`); `ETag`/`304`; `423` if vault locked |
+| `PUT /path` | seal a new file (`409` if exists — WORM; `400` on truncated `Content-Length`; `0-byte` allowed; `423` locked) |
 | `DELETE /path` | always `403` — WORM |
 | `GET /__api/list` | JSON listing (path, size, mime, created_at, root_hash) |
-| `POST /__api/msg` | post to the vault's message board `{"body": …}` → 201 |
-| `GET /__api/msg?since=N` | board messages after id N |
+| `POST /__api/msg` | post to the vault's message board `{"body": …}` → 201 (max 2000 chars, control chars stripped) |
+| `GET /__api/msg?since=N&limit=M` | board messages after id N (max 500) |
 | `GET /__api/browse?dir=` | listing under `--share-root` (403 when off / escaping) |
-| `POST /__api/ingest` | seal server-local files `{paths, into}` (WORM, traversal-locked) |
-| `GET /__api/auth` | `{"auth": bool}` — whether the password gate is on |
+| `GET /__api/browse?dir=&recursive=1` | internal recursive listing (used by remote picker) |
+| `POST /__api/ingest` | seal server-local files `{paths:[...max 200], into}` (max 2000 files, `409` WORM, `403` traversal/symlink) |
+| `GET /__api/auth` | `{"auth": bool, "share_root": bool}` — password gate + share-root presence |
 
 Auth (if set): HTTP Basic, PBKDF2-HMAC-SHA256, 100k iterations.
 Disable it for trusted LANs with `--auth off` — encryption stays on.
@@ -288,7 +299,9 @@ sealed and streamed back out of it:
 | PUT 700 MB into the constrained server | 201 · **~48–68 MB/s** |
 | GET full + sha256 verify | byte-exact |
 | Seek p50/p95 | 5 ms / 21 ms |
-| Server peak memory | **~400–880 MB of 1024** (incl. reclaimable mmap cache) |
+| Server peak memory | **~220–880 MB of 1024** (incl. reclaimable mmap 512 MB + cache 64 MB) — latest run `~226 MB` |
+
+> Note: `PRAGMA mmap_size=512M` + `cache_size=-64000` are tunable; `MemoryMax=1G` leaves headroom but a real Pi will ingest slower while the memory profile holds.
 
 Memory stays flat because files stream in chunks — the ceiling is your disk,
 not your RAM. Reproduce with `python3 benchmark.py --lowmem` (Linux +
@@ -309,10 +322,10 @@ Every promise the docs make, measured ([full sheet](BENCHMARKS.md)):
 | **Crash consistency** — `kill -9` mid-ingest, restart | pre-crash file byte-exact · half-written file invisible (`404`) · `--gc` reclaimed orphans · `--check` PASS |
 | **Multi-viewer storm** — 3 simultaneous decoders + seek noise | ≈**64 fps** aggregate · seek-noise p50 4.2 ms under load |
 | **Write endurance** — 5 GB sustained in 45 s | 113 MB/s mean · commit latency stable (259→293 ms p50) · WAL capped at 32 MB |
-| **At-rest encryption cost** — AES-256-GCM on/off | seals ≈14–25% slower · reads within ~40% · range seeks unaffected (2.5 ms p50) · unlock ~42 ms |
+| **At-rest encryption cost** — AES-256-GCM on/off | seals ≈14–25% slower (`+22%` measured) · reads within ~40% · range seeks `~2–3 ms p50` · unlock `~42–60 ms` |
 | **Message board** — post → readable | ~0.3 ms roundtrip |
-| **Remote ingest** — `--share-root`, 96 MB via one POST | **82.7 MB/s** server-side · 20-file batch in 160 ms · traversal → `403` |
-| **Remote ingest** — `--share-root`, 2 paths via one POST | sealed server-side in ~2 ms · traversal attempts → `403` · re-ingest → `409` |
+| **Remote ingest** — `--share-root`, 96 MB via one POST | **82.7 MB/s** server-side · 20-file batch in 160 ms · traversal/symlink → `403` |
+| **Remote ingest** — batch 20 × 512 KB in one POST | 20/20 sealed in `~160 ms` · re-ingest → `409` |
 
 The WORM race test earned its keep: it exposed a real bug (losing writers
 stalled 60 s on SQLite lock timeouts, then died without a response) which is
@@ -362,8 +375,8 @@ wrapping it (scrypt, n=2¹⁵). Password changes re-wrap the master key in
 milliseconds — data is never re-encrypted. The message board is visible
 to anyone holding the vault password and is not replicated by sync.
 `--share-root` grants password holders read+seal access to that one
-directory (traversal-locked, additive-only) — point it at a downloads
-folder, never at `/`.
+directory (traversal- and symlink-locked, additive-only, **persisted** in vault config) — point it at a downloads
+folder, never at `/` (`/` is now refused). Paths are canonicalized (`/a/../b` → `/b`), truncated uploads are rejected (`400`), and `gc` holds a write lock to avoid orphans.
 
 ## Design notes
 smolvault is the distilled successor of DenseVault.

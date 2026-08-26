@@ -75,7 +75,7 @@ import zlib
 from collections import Counter, namedtuple
 from socketserver import ThreadingMixIn
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 log = logging.getLogger("smolvault")
 
@@ -83,6 +83,17 @@ EXIT_OK, EXIT_NOMATCH, EXIT_USAGE = 0, 1, 2
 
 NODE_NAME = None                   # set by --name / SMOLVAULT_NAME
 _feed_muted = threading.Event()    # set when a raw-mode view owns stdout
+
+# ---- compiled regexes / tunables (avoid per-request recompilation) ----
+_RANGE_RE = re.compile(r"\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*")
+_MOD_ARROW_RE = re.compile(r"\[1;\d+[ABCD]")
+WORM_MSG = "already sealed (WORM)"
+MAX_INGEST_PATHS = 200
+MAX_INGEST_JOBS = 2000
+DEBUG = os.environ.get("SMOLVAULT_DEBUG") not in (None, "", "0", "false", "False")
+
+# single gear table cached across Chunker instances (perf P-01)
+_GEAR_CACHE = None
 
 
 # ---------------------------------------------------------------------------
@@ -149,15 +160,18 @@ class Chunker:
     scan history and break resync-after-insert."""
 
     def __init__(self, stride=32):
-        state = 0x9E3779B97F4A7C15
-        gear = []
-        for _ in range(256):
-            state += 0x9E3779B97F4A7C15
-            z = state & 0xFFFFFFFFFFFFFFFF
-            z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
-            z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
-            gear.append((z ^ (z >> 31)) & 0xFFFFFFFFFFFFFFFF)
-        self.gear = tuple(gear)
+        global _GEAR_CACHE
+        if _GEAR_CACHE is None:
+            state = 0x9E3779B97F4A7C15
+            gear = []
+            for _ in range(256):
+                state += 0x9E3779B97F4A7C15
+                z = state & 0xFFFFFFFFFFFFFFFF
+                z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+                z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+                gear.append((z ^ (z >> 31)) & 0xFFFFFFFFFFFFFFFF)
+            _GEAR_CACHE = tuple(gear)
+        self.gear = _GEAR_CACHE
         self.stride = stride
         self.min_s = 64 * 1024
         self.max_s = 1024 * 1024
@@ -287,6 +301,23 @@ def mime_type(path):
 
 PutResult = namedtuple("PutResult", "size root_hash new_bytes new_chunks")
 
+def _parse_content_length(headers, max_len=None):
+    """Parse Content-Length from headers dict, return int or None. Returns (value, error_code)."""
+    raw = headers.get("Content-Length")
+    if raw is None:
+        return -1, 411  # missing
+    raw = raw.strip()
+    try:
+        v = int(raw)
+    except (ValueError, TypeError):
+        return None, 400
+    if v < 0:
+        return None, 400
+    if max_len is not None and v > max_len:
+        return None, 400
+    return v, None
+
+
 
 class ExistsError(Exception):
     pass
@@ -369,7 +400,6 @@ class _Crypto:
     def seal(cls, key, nonce, pt, aad=b""):
         """AES-256-GCM encrypt. Returns (ciphertext, tag16)."""
         import ctypes as c
-        v, i, POINTER = c.c_void_p, c.c_int, c.POINTER
         l = cls.lib()
         ctx = l.EVP_CIPHER_CTX_new()
         if not ctx:
@@ -402,7 +432,6 @@ class _Crypto:
         """AES-256-GCM decrypt+authenticate. ct_with_tag = ciphertext||tag.
         Raises ValueError on authentication failure."""
         import ctypes as c
-        v, i, POINTER = c.c_void_p, c.c_int, c.POINTER
         l = cls.lib()
         if len(ct_with_tag) < 16:
             raise ValueError("ciphertext too short")
@@ -478,7 +507,7 @@ class Store:
     def conn(self):
         c = getattr(self._local, "conn", None)
         if c is None:
-            c = sqlite3.connect(self.path, timeout=60.0)
+            c = sqlite3.connect(self.path, timeout=2.0)
             c.execute("PRAGMA journal_mode=WAL")
             c.execute("PRAGMA synchronous=NORMAL")
             c.execute("PRAGMA mmap_size=536870912")
@@ -624,27 +653,6 @@ class Store:
                 progress(done, total)
         return done
 
-    def change_password(self, old, new):
-        """Rotate the auth hash and re-wrap the master key under *new*.
-        Data chunks are never re-encrypted."""
-        if not self.check_password(old):
-            raise ValueError("incorrect current password")
-        self.set_password(new)
-        if self.enc_enabled():
-            cfg = self._enc_cfg()
-            kek_old = self._kek(old, bytes.fromhex(cfg["enc_salt"]))
-            nonce, rest = cfg["enc_mk"][:24], cfg["enc_mk"][24:]
-            mk = _Crypto.open(kek_old, bytes.fromhex(nonce),
-                              bytes.fromhex(rest), aad=b"sv-mk")
-            kek_new = self._kek(new, bytes.fromhex(cfg["enc_salt"]))
-            wn = os.urandom(12)
-            ct, tag = _Crypto.seal(kek_new, wn, mk, aad=b"sv-mk")
-            c = self.conn()
-            c.execute("UPDATE config SET value=? WHERE key='enc_mk'",
-                      ((wn + ct + tag).hex(),))
-            c.commit()
-            self._load_keys(mk)
-
     def _kek(self, password, salt):
         return hashlib.scrypt(password.encode(), salt=salt, n=2 ** 15,
                               r=8, p=1, dklen=32, maxmem=64 * 1024 * 1024)
@@ -723,7 +731,7 @@ class Store:
     # ---- message board (the one deliberately mutable thing) ---------------
 
     MAX_MESSAGES = 500
-    _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+    _CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
     def post_msg(self, sender, kind, body):
         """Post to this vault's board. Returns the message id.
@@ -963,18 +971,34 @@ class Store:
         return ok
 
     def gc(self):
-        c = self.conn()
-        referenced = set()
-        for (manifest,) in c.execute("SELECT manifest FROM files"):
-            referenced.update(json.loads(manifest)["chunks"])
-        all_h = {r[0] for r in c.execute("SELECT hash FROM chunks")}
-        orphans = all_h - referenced
-        if orphans:
-            c.executemany("DELETE FROM chunks WHERE hash=?",
-                          [(h,) for h in orphans])
-            c.commit()
-        log.info("gc: %d orphaned chunk(s) removed", len(orphans))
-        c.execute("VACUUM")
+        # single-writer lock prevents race with concurrent PUT (C2)
+        with self._wlock:
+            c = self.conn()
+            # use IMMEDIATE to fail fast if another process holds write lock
+            try:
+                c.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError:
+                log.warning("gc: vault busy, skipped")
+                return
+            try:
+                referenced = set()
+                for (manifest,) in c.execute("SELECT manifest FROM files"):
+                    referenced.update(json.loads(manifest)["chunks"])
+                all_h = {r[0] for r in c.execute("SELECT hash FROM chunks")}
+                orphans = all_h - referenced
+                if orphans:
+                    c.executemany("DELETE FROM chunks WHERE hash=?",
+                                   [(h,) for h in orphans])
+                c.commit()
+            except Exception:
+                c.rollback()
+                raise
+            log.info("gc: %d orphaned chunk(s) removed", len(orphans))
+            # VACUUM outside the main transaction but still under _wlock
+            try:
+                c.execute("VACUUM")
+            except sqlite3.OperationalError:
+                log.warning("gc: vacuum failed (busy)")
 
 
 CACHE = "max-age=31536000, immutable"
@@ -989,7 +1013,7 @@ def parse_range(header, size):
     Parse a single-range `bytes=` header. Returns (start, end) inclusive,
     None to ignore the header (serve 200), raises RangeError for 416.
     """
-    m = re.fullmatch(r"\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*", header)
+    m = _RANGE_RE.fullmatch(header)
     if not m:
         return None                      # multi-range/other units: ignore
     a, b = m.group(1), m.group(2)
@@ -1005,12 +1029,23 @@ def parse_range(header, size):
         raise RangeError()
     end = int(b) if b else size - 1
     if end < start:
-        return None                      # invalid spec: ignore header
+        raise RangeError()               # RFC 7233: unsatisfiable
     return (start, min(end, size - 1))
 
 
 def _norm(path):
-    return "/" + "/".join(p for p in urllib.parse.unquote(path).split("/") if p)
+    # canonical vault path: strip query/fragment, unquote, resolve . and ..
+    raw = urllib.parse.urlparse(path).path
+    parts = []
+    for p in urllib.parse.unquote(raw).split("/"):
+        if p == "" or p == ".":
+            continue
+        if p == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(p)
+    return "/" + "/".join(parts)
 
 
 def _is_dir(store, path):
@@ -1153,38 +1188,59 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self._authed():
             return
         norm = _norm(self.path)
-        length = int(self.headers.get("Content-Length") or -1)
-        if length < 0:
-            self._head(411, 0, extra={"Connection": "close"})
+        length, err = _parse_content_length(self.headers)
+        if err:
+            self._head(err, 0, extra={"Connection": "close"})
             self.close_connection = True
             self.end_headers(); return
-        if length == 0:
-            self._head(400, 0, extra={"Connection": "close"})
-            self.close_connection = True
-            self.end_headers(); return
-
+        # allow 0-byte files (H2 parity)
+        # length==0 is valid: empty file
         reader = _Bounded(self.rfile, length)
         try:
             res = self.store.put(norm, reader)
         except ExistsError:
             log.warning(gray("WORM rejected overwrite of %s"), norm)
-            # body not drained: poison the socket for keep-alive reuse
-            self._head(409, 0,
+            body = b"sealed: already exists\n"
+            self._head(409, len(body),
                        extra={"Content-Type": "text/plain",
                               "Connection": "close"})
             self.close_connection = True
             self.end_headers()
-            self.wfile.write(b"sealed: already exists\n")
+            self.wfile.write(body)
             return
         except sqlite3.OperationalError as e:
-            # cross-process writer contention survived the busy timeout
             log.error(red("db busy on PUT %s: %s"), norm, e)
             self._head(503, 0, extra={"Retry-After": "2",
                                       "Connection": "close"})
             self.close_connection = True
             self.end_headers()
             return
-        dedup = f"{res.new_bytes/res.size*100:.0f}% new" if res.size else ""
+        except LockedVault:
+            body = b"vault locked\n"
+            self._head(423, len(body), extra={"Content-Type": "text/plain",
+                                      "Connection": "close"})
+            self.close_connection = True
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        # C1: verify Content-Length fully consumed; truncated PUT must not seal (detect via store size vs length)
+        if length != res.size:
+            # If client sent less/more than declared, remove the partial file and signal error
+            # truncated/short read: manifest size differs from declared length
+            try:
+                self.store.conn().execute("DELETE FROM files WHERE path=?", (norm,))
+                self.store.conn().commit()
+            except Exception:
+                pass
+            log.error(red("truncated PUT %s: declared %d got %d"), norm, length, res.size)
+            body = b"truncated upload\n"
+            self._head(400, len(body), extra={"Content-Type": "text/plain",
+                                      "Connection": "close"})
+            self.close_connection = True
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        dedup = f"{res.new_bytes/res.size*100:.0f}% new" if res.size else "0% new"
         log.info("%s %s  (%s) · %s", green("sealed"), norm, fmt(res.size),
                  gray(dedup))
         self._head(201, 0, extra={"ETag": f'"{res.root_hash}"'})
@@ -1200,6 +1256,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         if not self._authed():
             return
+        if self.store.enc_enabled() and not self.store.is_unlocked():
+            body = b"vault locked\n"
+            self._head(423, len(body), extra={"Content-Type": "text/plain", "Connection": "close"})
+            self.close_connection = True
+            self.end_headers()
+            self.wfile.write(body)
+            return
         row = self.store.lookup(_norm(self.path))
         if not row:
             self.send_error(404)
@@ -1211,16 +1274,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._authed():
             return
-        if _norm(self.path) == "/__api/list":
+        parsed = urllib.parse.urlparse(self.path)
+        pnorm = _norm(parsed.path)
+        if pnorm == "/__api/list":
             self._api_list()
             return
-        if _norm(self.path) == "/__api/auth":
+        if pnorm == "/__api/auth":
             self._api_auth_state()
             return
-        if _norm(self.path).split("?")[0] == "/__api/browse":
+        if pnorm == "/__api/browse":
             self._api_browse()
             return
-        if _norm(self.path).split("?")[0] == "/__api/msg":
+        if pnorm == "/__api/msg":
             self._api_msg()
             return
         row = self.store.lookup(_norm(self.path))
@@ -1229,6 +1294,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._dir_page()
                 return
             self.send_error(404)
+            return
+        if self.store.enc_enabled() and not self.store.is_unlocked():
+            body = b"vault locked\n"
+            self._head(423, len(body), extra={"Content-Type": "text/plain", "Connection": "close"})
+            self.close_connection = True
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         etag = row["root_hash"]
@@ -1244,8 +1316,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         base_extra = {"Accept-Ranges": "bytes", "Cache-Control": CACHE}
         rng_hdr = self.headers.get("Range")
 
-        if rng_hdr and (not self.headers.get("If-Range")
-                        or self.headers.get("If-Range").strip('"') == etag):
+        if_rng = self.headers.get("If-Range")
+        if_rng_ok = True
+        if if_rng:
+            # handle weak ETag W/"..." and strip quotes
+            cand = if_rng.strip().removeprefix("W/").strip().strip('"')
+            # if it's a date, ignore range (serve 200)
+            # simple heuristic: dates contain comma
+            if "," in if_rng and cand != etag:
+                if_rng_ok = False
+            elif cand != etag:
+                if_rng_ok = False
+        if rng_hdr and if_rng_ok:
             try:
                 rng = parse_range(rng_hdr, row["size"])
             except RangeError:
@@ -1265,8 +1347,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         self.wfile.write(piece)
                 except (BrokenPipeError, ConnectionResetError):
                     pass
-                except ValueError as e:
+                except (ValueError, LockedVault) as e:
                     log.error(red("read %s: %s"), row["path"], e)
+                    self.close_connection = True
                 return
 
         self._head(200, row["size"], etag, row["mime"], base_extra)
@@ -1276,8 +1359,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(piece)
         except (BrokenPipeError, ConnectionResetError):
             pass
-        except ValueError as e:
+        except (ValueError, LockedVault) as e:
             log.error(red("read %s: %s"), row["path"], e)
+            self.close_connection = True
 
     def _api_list(self):
         """Machine-readable listing for remote clients."""
@@ -1367,12 +1451,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"share root not enabled on this vault\n")
             return
-        length = int(self.headers.get("Content-Length") or -1)
-        if length <= 0 or length > 262144:
+        length, err = _parse_content_length(self.headers, max_len=262144)
+        if err or length <= 0:
             self._head(400, 0); self.end_headers(); return
         try:
             req = json.loads(self.rfile.read(length))
-            rels = [str(p) for p in req.get("paths", [])][:200]
+            raw_paths = req.get("paths", [])
+            if not isinstance(raw_paths, list):
+                raise ValueError("paths must be list")
+            if len(raw_paths) > MAX_INGEST_PATHS:
+                payload = json.dumps({"error": f"too many paths (max {MAX_INGEST_PATHS})"}).encode()
+                self._head(400, len(payload), None, "application/json"); self.end_headers(); self.wfile.write(payload); return
+            rels = [str(p) for p in raw_paths]
             into = str(req.get("into", "/")) or "/"
         except (ValueError, json.JSONDecodeError):
             self._head(400, 0); self.end_headers(); return
@@ -1382,8 +1472,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         def queue(abs_target):
             """Expand one accepted path into (abs_file, rel_label) jobs.
-            Directories walk recursively; missing paths yield a 404 marker."""
+            Directories walk recursively; missing paths yield a 404 marker.
+            Symlink files escaping sr are skipped (C3)."""
+            if os.path.islink(abs_target):
+                rp = os.path.realpath(abs_target)
+                if not contained(rp):
+                    yield None, None
+                    return
             if os.path.isfile(abs_target):
+                if not contained(os.path.realpath(abs_target)):
+                    yield None, None
+                    return
                 yield abs_target, None
                 return
             if not os.path.isdir(abs_target):
@@ -1391,11 +1490,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             for dp, dns, fns in os.walk(abs_target):
                 dns[:] = [x for x in dns
-                          if not x.startswith(".") and x != "__pycache__"]
+                           if not x.startswith(".") and x != "__pycache__" and not os.path.islink(os.path.join(dp, x))]
                 for fn in sorted(fns, key=natural_key):
                     if fn.startswith("."):
                         continue
+                    if fn.endswith((".vault", ".vault-shm", ".vault-wal")):
+                        continue
                     fp = os.path.join(dp, fn)
+                    if os.path.islink(fp):
+                        continue
+                    if not contained(os.path.realpath(fp)):
+                        continue
                     if os.path.isfile(fp):
                         yield fp, None
 
@@ -1422,6 +1527,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not found:
                 results.append({"path": rel, "status": 404})
 
+        if len(jobs) > MAX_INGEST_JOBS:
+            payload = json.dumps({"error": f"too many files (max {MAX_INGEST_JOBS})"}).encode()
+            self._head(400, len(payload), None, "application/json"); self.end_headers(); self.wfile.write(payload); return
         for abs_f, dest, rel_f in jobs:
             try:
                 with open(abs_f, "rb") as f:
@@ -1453,14 +1561,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._authed():
             return
-        norm = _norm(self.path).split("?")[0]
-        length = int(self.headers.get("Content-Length") or -1)
+        norm = urllib.parse.urlparse(self.path).path
+        norm = _norm(norm)
+        length, err = _parse_content_length(self.headers)
         if norm == "/__api/ingest":
-            if length <= 0 or length > 262144:
+            if err or length <= 0 or length > 262144:
                 self._head(400, 0); self.end_headers(); return
             self._api_ingest()
             return
-        if norm != "/__api/msg" or length <= 0 or length > 16384:
+        if norm != "/__api/msg" or err or length <= 0 or length > 16384:
             self._head(400, 0); self.end_headers(); return
         try:
             body = json.loads(self.rfile.read(length)).get("body", "")
@@ -1673,17 +1782,20 @@ def collect_files(root):
     """Walk *root* recursively. Returns (items, hidden, broken) where items
     are (abspath, relpath) pairs with '/'-separated relpaths, natural-sorted.
     Dir symlinks are never descended (loop safety); file symlinks follow their
-    target; dotfiles are skipped and counted."""
+    target; dotfiles are skipped and counted. Vault artifacts and __pycache__ are skipped."""
     items, hidden, broken = [], 0, 0
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         for d in list(dirnames):
-            if d.startswith("."):
+            if d.startswith(".") or d == "__pycache__":
                 dirnames.remove(d)
                 hidden += 1
             elif os.path.islink(os.path.join(dirpath, d)):
                 dirnames.remove(d)                # prune link trees, no loops
         for f in filenames:
-            if f.startswith("."):
+            if f.startswith(".") or f == "__pycache__":
+                hidden += 1
+                continue
+            if f.endswith((".vault", ".vault-shm", ".vault-wal")):
                 hidden += 1
                 continue
             full = os.path.join(dirpath, f)
@@ -1755,7 +1867,7 @@ def ingest_plan_ok(items, into, asker):
     if len(items) <= PLAN_FILES and total <= PLAN_BYTES:
         return True
     try:
-        return asker("  proceed? [y/N]: ").strip().lower() == "y"
+        return asker("  proceed? [Y/n]: ").strip().lower() in ("", "y", "yes")
     except (EOFError, KeyboardInterrupt):
         return False
 
@@ -2173,7 +2285,13 @@ def play_url(url, mime=None, player=None):
     if shutil.which(player) is None:
         print(red(f"  ✗ player '{player}' not found"))
         return EXIT_NOMATCH
-    print(dim(f"  ▶ {player} {url}"))
+    # redact password in log (S-02)
+    try:
+        _parsed = urllib.parse.urlparse(url)
+        _safe = url.replace(_parsed.password or "", "***") if _parsed.password else url
+    except Exception:
+        _safe = url
+    print(dim(f"  ▶ {player} {_safe}"))
     try:
         return subprocess.run([player, url]).returncode
     except KeyboardInterrupt:
@@ -2414,9 +2532,6 @@ class BrowseState:
     def _scan(self, d):
         return scan_dir(d, self.VAULT_SUFFIXES)
 
-    def _rel(self, abspath):
-        return os.path.relpath(abspath, self.root).replace(os.sep, "/")
-
     def _rel_anchor(self, abspath):
         r = os.path.relpath(abspath, self.anchor).replace(os.sep, "/")
         return None if r.startswith("..") else r
@@ -2456,7 +2571,7 @@ class BrowseState:
         if abs_dir not in self._subtree_cache:
             acc = set()
             for dp, dns, fns in os.walk(abs_dir):
-                dns[:] = [x for x in dns if not x.startswith(".")]
+                dns[:] = [x for x in dns if not x.startswith(".") and x != "__pycache__"]
                 for fn in fns:
                     if fn.startswith("."):
                         continue
@@ -2477,7 +2592,7 @@ class BrowseState:
         e = self.current()
         if not e:
             return
-        name, is_dir, size, abspath = e
+        _, is_dir, _, abspath = e
         if is_dir:
             self.toggle_subtree(abspath)
         else:
@@ -2492,7 +2607,7 @@ class BrowseState:
             self.checked |= files
 
     def select_visible(self):
-        for name, is_dir, size, abspath in self.entries():
+        for _, is_dir, _, abspath in self.entries():
             if is_dir:
                 self.checked |= self._subtree_files(abspath)
             else:
@@ -2633,9 +2748,9 @@ def _parse_escape(seq):
         return "right"
     if body in ("[D", "OD"):
         return "left"
-    if re.fullmatch(r"\[1;\d+[ABCD]", body):
+    if _MOD_ARROW_RE.fullmatch(body):
         return {"A": "up", "B": "down",
-                "C": "right", "D": "left"}[body[-1]]
+                 "C": "right", "D": "left"}[body[-1]]
     if body == "[Z":
         return "shifttab"
     return "ignore"
@@ -2750,7 +2865,7 @@ def browse_picker(start=None):
         return None
     if not (sys.stdin.isatty() and sys.stdout.isatty()
             and _termios_available()):
-        items, _h, _b = collect_files(start)
+        items, _, _ = collect_files(start)
         rows = [{"path": rel, "size": os.path.getsize(full)}
                 for full, rel in items]
         m = {rel: full for full, rel in items}
@@ -2942,11 +3057,10 @@ def board_live(store=None, fetch=None, send=None, read_key=None,
     try:
         if interactive:
             sys.stdout.write("\x1b[2J\x1b[H\x1b[?25l")
-        import time as _t
-        last_poll = _t.perf_counter()
+        last_poll = time.perf_counter()
         drain_and_render()
         while True:
-            now = _t.perf_counter()
+            now = time.perf_counter()
             fired = now - last_poll >= poll
             if fired:
                 last_poll = now
@@ -3080,10 +3194,10 @@ def play_query(store, query, player=None, password=None):
         print(yellow(f"  '{path}' is {mime} — not watchable."))
         if sys.stdin.isatty():
             try:
-                ans = input(cyan("  export a copy instead? [y/N]: ")).strip().lower()
+                ans = input(cyan("  export a copy instead? [Y/n]: ")).strip().lower()
             except (EOFError, KeyboardInterrupt):
                 ans = ""
-            if ans == "y":
+            if ans in ("", "y", "yes"):
                 return export_file(store, path)
         else:
             print(dim("  (use --get to export it)"))
@@ -3482,11 +3596,11 @@ class Wizard:
                     if sys.stdin.isatty():
                         try:
                             ans = input(cyan(
-                                "  encrypt vault at rest? [y/N]: "
+                                "  encrypt vault at rest? [Y/n]: "
                             )).strip().lower()
                         except (EOFError, KeyboardInterrupt):
                             ans = ""
-                        if ans == "y":
+                        if ans in ("", "y", "yes"):
                             self.store.enable_encryption(pwd)
                             self.pw = pwd
                             n = self.store.migrate_encryption()
@@ -3998,10 +4112,10 @@ def sync_vault(store, direction, host, port, assume_yes=False):
 
     if not assume_yes:
         try:
-            ans = input(cyan("  proceed? [y/N]: ")).strip().lower()
+            ans = input(cyan("  proceed? [Y/n]: ")).strip().lower()
         except (EOFError, KeyboardInterrupt):
             ans = ""
-        if ans != "y":
+        if ans not in ("", "y", "yes"):
             print(yellow("  cancelled"))
             return EXIT_OK
 
@@ -4021,7 +4135,29 @@ def sync_vault(store, direction, host, port, assume_yes=False):
                         print(red(f"  ✗ GET {path}: HTTP {resp.status}"))
                         failed += 1
                         continue
-                    store.put(path, _RespReader(resp), progress=bar.update)
+                    # verify Content-Length if present
+                    cl_header = resp.getheader("Content-Length")
+                    expected = sizes[path]
+                    if cl_header is not None:
+                        try:
+                            if int(cl_header) != expected:
+                                print(red(f"  ✗ GET {path}: size mismatch header {cl_header} vs expected {expected}"))
+                                failed += 1
+                                continue
+                        except ValueError:
+                            pass
+                    res = store.put(path, _RespReader(resp), progress=bar.update)
+                    # C6: verify root_hash and size
+                    theirs_row = theirs[path]
+                    if res.size != expected or res.root_hash != theirs_row["root_hash"]:
+                        print(red(f"  ✗ {path}: hash/size mismatch after sync (got {res.root_hash[:8]} vs {theirs_row['root_hash'][:8]})"))
+                        try:
+                            store.conn().execute("DELETE FROM files WHERE path=?", (path,))
+                            store.conn().commit()
+                        except Exception:
+                            pass
+                        failed += 1
+                        continue
                 finally:
                     conn.close()
             else:
@@ -4319,10 +4455,18 @@ def build_parser():
                     help="vault file (default: $SMOLVAULT_VAULT or wizard)")
     ap.add_argument("--host", default="127.0.0.1",
                     help="serve-mode bind address (default 127.0.0.1)")
-    ap.add_argument("--port", type=int, default=None,
+    def _port_type(s):
+        try:
+            v = int(s)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"port must be integer, got {s!r}")
+        if not 1 <= v <= 65535:
+            raise argparse.ArgumentTypeError(f"port {v} out of range 1-65535")
+        return v
+    ap.add_argument("--port", type=_port_type, default=None,
                     help="port (default 8100, remembered per-vault)")
-    ap.add_argument("-p", "--password", default="")
-    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("-p", "--password", default="", help="vault password (or set via prompt; also unlocks encrypted vault)")
+    ap.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
     ap.add_argument("--check", action="store_true", help="verify chunks, exit")
     ap.add_argument("--auth", choices=["on", "off"], metavar="on|off",
                     help="require the vault password for network access "
@@ -4369,6 +4513,7 @@ def build_parser():
     mg.add_argument("--info", metavar="PATH_OR_Q", help="file details")
     mg.add_argument("--get", metavar="PATH_OR_Q", help="export a file")
     mg.add_argument("-o", "--out", help="output filename for --get")
+    ap.epilog = " env: SMOLVAULT_VAULT default vault, SMOLVAULT_PLAYER player, SMOLVAULT_SERVER default host:port, SMOLVAULT_NAME node name, SMOLVAULT_DEBUG verbose, NO_COLOR disable color"
     return ap
 
 
@@ -4502,7 +4647,11 @@ def main(argv=None):
         if not os.path.isdir(sr):
             print(red(f"  ✗ share root is not a directory: {sr}"))
             return EXIT_NOMATCH
+        if sr == "/":
+            print(red(f"  ✗ refusing to expose root '/' as share root"))
+            return EXIT_NOMATCH
         store.cfg_set("share_root", sr)
+        # persisted: remains exposed even without flag next run (see README caveat)
         print(green(f"  ✓ share root exposed to clients: {sr}"))
 
     action_flags = any([args.add, args.list, args.du, args.search,

@@ -139,10 +139,6 @@ class TestWiring(BrowseTestBase):
         self.assertIsNone(picked)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestFrameProtocol(BrowseTestBase):
     def _frame(self, st):
         return sv._browse_render(st)
@@ -238,3 +234,7 @@ class TestBoardLive(BrowseTestBase):
         finally:
             builtins.input = real
         self.assertEqual(rc, sv.EXIT_OK)
+
+
+if __name__ == "__main__":
+    unittest.main()

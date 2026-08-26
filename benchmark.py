@@ -17,7 +17,6 @@ import json
 import os
 import random
 import socket
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -134,17 +133,20 @@ seal_best = None
 for rep in range(2):
     rep_vault = os.path.join(W, f"bench{rep}.vault")
     t0 = time.perf_counter()
-    res = sv.Store(rep_vault).put("/media/big.bin", open(bigfile, "rb"))
+    with open(bigfile, "rb") as _fb:
+        res = sv.Store(rep_vault).put("/media/big.bin", _fb)
     dt = time.perf_counter() - t0
     seal_best = dt if seal_best is None else min(seal_best, dt)
 dt = seal_best
-store.put("/media/big.bin", open(bigfile, "rb"))     # make it present for reads
+with open(bigfile, "rb") as _fb:
+    store.put("/media/big.bin", _fb)     # make it present for reads
 rec("ingest", f"{mb(BIG):.0f} MB high-entropy seal (best of 2)",
     f"{dt:.1f}s · {mb(BIG)/dt:.1f} MB/s")
 
 t0 = time.perf_counter()
 try:
-    store.put("/media/big.bin", open(bigfile, "rb"))
+    with open(bigfile, "rb") as _fb:
+        store.put("/media/big.bin", _fb)
 except sv.ExistsError:
     pass
 dt = time.perf_counter() - t0
@@ -154,7 +156,7 @@ text32 = make_text(SIZE)
 t0 = time.perf_counter()
 store.put("/docs/text.txt", io.BytesIO(text32))
 dt = time.perf_counter() - t0
-rec("ingest", f"{mb(SIZE):.0f} MB text seal",
+rec("ingest/text", f"{mb(SIZE):.0f} MB text seal",
     f"{dt:.2f}s · {mb(SIZE)/dt:.1f} MB/s")
 
 row = store.lookup("/media/big.bin")
@@ -309,7 +311,8 @@ def req(method, path, body=None, headers=None):
 
 
 t0 = time.perf_counter()
-st, _, _ = req("PUT", "/http/big.mp4", body=open(bigfile, "rb"),
+with open(bigfile, "rb") as _fb:
+    st, _, _ = req("PUT", "/http/big.mp4", body=_fb,
                headers={"Content-Length": str(BIG)})
 dt = time.perf_counter() - t0
 rec("http", f"PUT {mb(BIG):.0f} MB over wire",
@@ -719,11 +722,12 @@ else:
 
 # ------------------------------------------------------- remote ingest
 hr("REMOTE INGEST (--share-root: client queues, server seals)")
-if hasattr(sv.Store, "enable_encryption") or True:
+if hasattr(sv.Store, "enable_encryption"):
     share_dir = os.path.join(W, "sharedir")
     os.makedirs(share_dir)
     share_payload = os.urandom(96 * 1024 * 1024)
-    open(os.path.join(share_dir, "clip.bin"), "wb").write(share_payload)
+    with open(os.path.join(share_dir, "clip.bin"), "wb") as _sf:
+        _sf.write(share_payload)
     os.makedirs(os.path.join(share_dir, "batch"))
     for i in range(20):
         open(os.path.join(share_dir, "batch", f"p{i:02}.bin"), "wb") \
@@ -793,9 +797,6 @@ if hasattr(sv.Store, "enable_encryption") or True:
         rec("share", f"batch ingest 20 × 512 KB in one POST",
             f"{n201}/20 sealed · {dt*1000:.0f} ms")
 
-        st, _ = riget("/__api/list")
-        rows_ = st and json.loads(open(os.path.join(W, "x"), "rb").read()) \
-            if False else None
         cc = http.client.HTTPConnection("127.0.0.1", RI_PORT, timeout=30)
         cc.request("GET", "/__api/list")
         r = cc.getresponse()
@@ -858,7 +859,8 @@ if LOWMEM:
                 t0 = time.perf_counter()
                 cp = http.client.HTTPConnection("127.0.0.1", LM_PORT,
                                                 timeout=300)
-                cp.request("PUT", "/lowmem/big.bin", body=open(bigfile, "rb"),
+                with open(bigfile, "rb") as _fb2:
+                    cp.request("PUT", "/lowmem/big.bin", body=_fb2,
                            headers={"Content-Length": str(BIG)})
                 st_ = cp.getresponse().status
                 cp.close()
@@ -879,8 +881,9 @@ if LOWMEM:
                         break
                     h.update(b_); n_ += len(b_)
                 conn.close()
-                ok_sha = h.hexdigest() == __import__("hashlib").sha256(
-                    open(bigfile, "rb").read()).hexdigest()
+                with open(bigfile, "rb") as _fb3:
+                    _exp = __import__("hashlib").sha256(_fb3.read()).hexdigest()
+                ok_sha = h.hexdigest() == _exp
                 rec("lowmem", "GET full + sha256 verify",
                     f"{mb(n_):.0f} MB · {(time.perf_counter()-tick_):.2f}s · "
                     f"byte-exact={ok_sha}")
