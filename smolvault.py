@@ -75,7 +75,7 @@ import zlib
 from collections import Counter, namedtuple
 from socketserver import ThreadingMixIn
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 log = logging.getLogger("smolvault")
 
@@ -1719,6 +1719,73 @@ def find_free_port(start, tries=20):
     return None
 
 
+def prompt_for_port(store, explicit=None):
+    """Port picker on vault creation. Returns chosen port and persists it.
+    - explicit (int) from --port wins without prompt
+    - else if TTY, prompt `port [suggested]:` where Enter = auto next free
+    - else auto pick.
+    Always persists via cfg_set('lan_port')."""
+    if explicit is not None:
+        try:
+            # reuse validator
+            v = int(explicit)
+            if not 1 <= v <= 65535:
+                raise ValueError()
+            # check free (try bind)
+            s = socket.socket()
+            s.bind(("0.0.0.0", v))
+            s.close()
+            store.cfg_set("lan_port", v)
+            print(green(f"  ✓ port {v} configured"))
+            return v
+        except Exception as e:
+            print(red(f"  ✗ port {explicit!r} unavailable ({e}), picking auto…"))
+    # suggest next free from 8100 or from env SMOLVAULT_PORT
+    env_port = os.environ.get("SMOLVAULT_PORT")
+    try:
+        env_val = int(env_port) if env_port else None
+        if env_val and 1 <= env_val <= 65535:
+            suggested = find_free_port(env_val) or env_val
+        else:
+            suggested = find_free_port(8100) or 8100
+    except Exception:
+        suggested = find_free_port(8100) or 8100
+    # if not TTY, auto
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        store.cfg_set("lan_port", suggested)
+        return suggested
+    # interactive prompt
+    for attempt in range(3):
+        try:
+            raw = input(cyan(f"  port [{suggested}]: ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            raw = ""
+        if not raw:
+            chosen = suggested
+            store.cfg_set("lan_port", chosen)
+            print(green(f"  ✓ port {chosen} (auto)"))
+            return chosen
+        try:
+            v = int(raw)
+            if not 1 <= v <= 65535:
+                raise ValueError("out of range 1-65535")
+            s = socket.socket()
+            s.bind(("0.0.0.0", v))
+            s.close()
+            store.cfg_set("lan_port", v)
+            print(green(f"  ✓ port {v} configured"))
+            return v
+        except OSError as e:
+            nxt = find_free_port(v + 1) or suggested
+            print(red(f"  ✗ port {raw} busy ({e}) — try {nxt}"))
+            suggested = nxt
+        except Exception as e:
+            print(red(f"  ✗ invalid port {raw!r}: {e}"))
+    # fallback auto
+    store.cfg_set("lan_port", suggested)
+    return suggested
+
+
 def make_server(store, host, port):
     srv = MediaServer((host, port), Handler)
     srv.store = store
@@ -2674,6 +2741,214 @@ class RemoteBrowseState(BrowseState):
         return out
 
 
+class VaultBrowseState:
+    """Navigator over vault-stored files (virtual FS derived from Store.list_dir).
+
+    *store* is a Store (local) or ListingStore (remote rows). Paths are vault-absolute
+    with leading '/'. Reuses BrowseState keymap but shows size/mime and supports
+    single-file pick for get/watch or multi for export.
+    """
+
+    def __init__(self, store):
+        self.store = store
+        self.root = "/"
+        self.anchor = "/"
+        self.cur = "/"
+        self.query = ""
+        self.sel = 0
+        self._rows_cache = None
+
+    def _all_rows(self):
+        if self._rows_cache is None:
+            try:
+                self._rows_cache = list(self.store.all_files())
+            except Exception:
+                self._rows_cache = []
+        return self._rows_cache
+
+    def _scan(self, d):
+        # derive entries from vault file paths (prefix tree)
+        prefix = d.rstrip("/") + "/" if d != "/" else "/"
+        dirs_set = set()
+        files = []
+        for r in self._all_rows():
+            p = r["path"]
+            if not p.startswith(prefix) and p != prefix.rstrip("/"):
+                if d != "/":
+                    continue
+                # for root, include top-level files like /a.txt (prefix "/")
+                if not p.startswith("/"):
+                    continue
+            if d == "/":
+                rest = p.lstrip("/")
+            else:
+                if not p.startswith(prefix):
+                    continue
+                rest = p[len(prefix):]
+            if not rest:
+                continue
+            if "/" in rest:
+                dirs_set.add(rest.split("/", 1)[0])
+            else:
+                files.append((rest, False, r["size"], p, r))
+        dirs = sorted([(n, True, 0, prefix.rstrip("/") + "/" + n if prefix != "/" else "/" + n, None) for n in dirs_set], key=lambda t: natural_key(t[0]))
+        files_sorted = sorted(files, key=lambda t: natural_key(t[0]))
+        # filter by query
+        q = self.query.lower()
+        out = []
+        for name, is_dir, size, abspath, row in dirs + files_sorted:
+            if q and q not in name.lower():
+                continue
+            out.append((name, is_dir, size, abspath))
+        return out
+
+    def entries(self):
+        # limit to current dir's direct children, already filtered
+        return self._scan(self.cur)
+
+    def current(self):
+        es = self.entries()
+        return es[self.sel] if 0 <= self.sel < len(es) else None
+
+    def descend(self):
+        e = self.current()
+        if e and e[1]:
+            # enter dir
+            name = e[0]
+            if self.cur == "/":
+                self.cur = "/" + name
+            else:
+                self.cur = self.cur.rstrip("/") + "/" + name
+            self.query = ""
+            self.sel = 0
+
+    def parent(self):
+        if self.cur != "/":
+            self.cur = self.cur.rsplit("/", 1)[0] or "/"
+            if not self.cur.startswith("/"):
+                self.cur = "/" + self.cur
+            self.query = ""
+            self.sel = 0
+
+    def file_row(self, vault_path):
+        for r in self._all_rows():
+            if r["path"] == vault_path:
+                return r
+        return None
+
+
+def vault_browse_picker(store, label="browse"):
+    """Vault file manager (tiny) for get/watch. Returns (vault_path, row) or None.
+    Uses VaultBrowseState with same raw protocol as browse_picker."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty() and _termios_available()):
+        # fallback: live search
+        rows = list(store.all_files())
+        if not rows:
+            print(yellow("  (library is empty)"))
+            return None
+        picked = live_search(rows, player_label=label)
+        return picked
+    import termios
+    import tty
+    st = VaultBrowseState(store)
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\x1b[2J\x1b[H\x1b[?25l")
+        while True:
+            sys.stdout.write(_vault_browse_render(st, label))
+            sys.stdout.flush()
+            key = _read_key(fd)
+            if key is None or key in ("esc", "\x1b", "\x03", "\x04"):
+                return None
+            n = len(st.entries())
+            if key == "up":
+                st.sel = max(0, st.sel - 1)
+            elif key == "down":
+                st.sel = min(max(n - 1, 0), st.sel + 1)
+            elif key == "right":
+                st.descend()
+            elif key == "left":
+                st.parent()
+            elif key in ("\r", "\n"):
+                e = st.current()
+                if e and e[1]:
+                    st.descend()
+                elif e:
+                    row = st.file_row(e[3])
+                    if row is not None:
+                        return (e[3], row)
+            elif key in ("i", "I"):
+                e = st.current()
+                if e and not e[1]:
+                    row = st.file_row(e[3])
+                    if row:
+                        # show info overlay briefly (leave raw, print then wait)
+                        sys.stdout.write("\r\x1b[J\x1b[?25h")
+                        sys.stdout.flush()
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+                        show_info(store, e[3])
+                        input(dim("  press Enter to return…"))
+                        tty.setraw(fd)
+                        sys.stdout.write("\x1b[2J\x1b[H\x1b[?25l")
+            elif key in ("\x7f", "\b"):
+                if st.query:
+                    st.query = st.query[:-1]
+                    st.sel = 0
+                else:
+                    st.parent()
+            elif len(key) == 1 and key >= " ":
+                st.query += key
+                st.sel = 0
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\r\x1b[J\x1b[?25h")
+        sys.stdout.flush()
+
+
+def _vault_browse_render(st, label="browse"):
+    """Vault browser frame, raw-protocol."""
+    def line(s=""):
+        return "\r" + s + "\x1b[K"
+    head = f"  {label} ❯ " + (st.cur if st.cur != "/" else "/")
+    if st.query:
+        head += dim(f"   filter '{st.query}'")
+    es = st.entries()
+    st.sel = min(st.sel, max(len(es) - 1, 0))
+    counts = dim(f"   {len(es)} shown")
+    if not st._all_rows():
+        counts += yellow(" · empty")
+    B = "─" * 66
+    lines = ["\x1b[J" + line(head + counts), line(dim("  " + B))]
+    lo = max(0, min(st.sel - 6, max(len(es) - 12, 0)))
+    window = es[lo:lo + 12]
+    window += [None] * (12 - len(window))
+    for i, entry in enumerate(window, lo):
+        if entry is None:
+            lines.append(line())
+            continue
+        name, is_dir, size, abspath = entry
+        cursor = " ❯ " if i == st.sel else "   "
+        if is_dir:
+            mark = dim("   dir")
+            name_col = cyan(name + "/")
+        else:
+            # file: show size and mime hint
+            row = st.file_row(abspath)
+            mime = (row["mime"] or "?").split("/")[-1][:10] if row else "?"
+            mark = dim(f"{fmt(size).rjust(10)} {mime}")
+            name_col = name
+        lines.append(line(f" {cursor} {name_col:<40}{mark}"))
+    lines.append(line(dim("  " + B)))
+    foot = "  ↑↓ move · → open · ← up · Enter pick · i info · esc"
+    if st.query:
+        foot += dim(" · backspace filter")
+    foot += dim(" · type to filter")
+    lines.append(line(foot))
+    return "\n".join(lines) + f"\r\x1b[{len(lines)}A"
+
+
 def remote_browse_picker(rv):
     """Navigator over a remote vault's share root. Returns
     [(virtual_path, relpath)] or None."""
@@ -3312,27 +3587,28 @@ def print_banner(vault, s, urls, auth_on, server_state="● running",
 WIZARD_MENU = f"""
     {cyan('a')} add       {dim('drop files · path · [b]rowse a folder')}
     {cyan('s')} search    {dim('find something')}
-    {cyan('p')} play      {dim('search → mpv  (w works too)')}
-    {cyan('l')} library   {dim('browse everything')}
+    {cyan('p')} play      {dim('search → mpv  (w) · [b]rowse vault')}
+    {cyan('l')} library   {dim('browse everything · [b]vault browser')}
     {cyan('d')} du        {dim('space by folder · find double-sealed files')}
     {cyan('m')} board     {dim("this vault's messages · clients & server post here")}
-    {cyan('i')} info      {dim('details about a file')}
-    {cyan('g')} get       {dim('export a copy out of the vault')}
+    {cyan('i')} info      {dim('details about a file · [b]browse')}
+    {cyan('g')} get       {dim('export a copy · [b]browse vault')}
     {cyan('c')} copy      {dim('stream link → clipboard')}
     {cyan('y')} sync      {dim('mirror another smolvault')}
     {cyan('S')} server    {dim('start/stop network sharing')}
+    {cyan('P')} port      {dim('change port')}
     {cyan('v')} verify    {dim('check vault integrity')}
     {cyan('q')} quit"""
 
 CLIENT_MENU = f"""
     {cyan('a')} add       {dim('drop files · path · [b]rowse, then upload')}
     {cyan('s')} search    {dim('find something')}
-    {cyan('p')} watch     {dim('remote search → player')}   {dim('(w too)')}
-    {cyan('l')} library   {dim('browse everything')}
+    {cyan('p')} watch     {dim('search → player · [b]browse vault')}
+    {cyan('l')} library   {dim('browse everything · [b]vault browser')}
     {cyan('d')} du        {dim('space by folder · find double-sealed files')}
     {cyan('m')} board     {dim("this vault's messages · post to the server")}
-    {cyan('i')} info      {dim('details about a file')}
-    {cyan('g')} get       {dim('export a copy')}
+    {cyan('i')} info      {dim('details about a file · [b]browse')}
+    {cyan('g')} get       {dim('export a copy · [b]browse vault')}
     {cyan('c')} copy      {dim('stream link → clipboard')}
     {cyan('r')} reconnect {dim('pick a different vault')}
     {cyan('q')} quit"""
@@ -3482,10 +3758,25 @@ class Wizard:
             print(red(f"  player '{explicit_player}' not found"))
             return
         rows = self.store.all_files()
-        chosen = live_search(rows)
-        if not chosen:
+        if not rows:
+            print(yellow("  (library is empty — seal files with [a])"))
             return
-        path, row = chosen
+        # tiny file manager for watch — [b]browse vault files, else live search
+        try:
+            mode = self.ask("  watch [b]rowse vault or [s]earch? [b/s]: ").strip().lower()
+        except QuitWizard:
+            return
+        if mode in ("b", "browse"):
+            picked = vault_browse_picker(self.store, label="watch")
+            if not picked:
+                return
+            path, row = picked
+            chosen = picked
+        else:
+            chosen = live_search(rows)
+            if not chosen:
+                return
+            path, row = chosen
         mime = row["mime"] or ""
         if not mime.startswith(("video/", "audio/", "image/")):
             print(yellow(f"  '{path}' is {mime} — not watchable. Use [g]."))
@@ -3537,9 +3828,15 @@ class Wizard:
             show_info(self.store, q)
 
     def do_get(self):
-        q = self.ask("  export which (path or search term): ")
+        # tiny file manager for get — [b]rowse vault
+        q = self.ask("  export [b]rowse vault or type path/term: ").strip()
         if not q:
             return
+        if q.lower() in ("b", "browse"):
+            picked = vault_browse_picker(self.store, label="get")
+            if not picked:
+                return
+            q = picked[0]
         out = self.ask(dim("  save as? [default: same name]") + " ").strip()
         export_file(self.store, q, out or None)
 
@@ -3550,6 +3847,47 @@ class Wizard:
 
     def do_board(self):
         board_prompt(store=self.store)
+
+    def do_port(self):
+        cur = self.store.cfg_get("lan_port") or "8100"
+        suggested = find_free_port(int(cur)) or cur
+        try:
+            raw = self.ask(cyan(f"  port [{cur}] (Enter=keep, type new or [auto]): ")).strip()
+        except QuitWizard:
+            return
+        if not raw:
+            print(dim(f"  keeping port {cur}"))
+            return
+        if raw.lower() in ("auto", "a"):
+            chosen = suggested
+        else:
+            try:
+                v = int(raw)
+                if not 1 <= v <= 65535:
+                    raise ValueError("out of range 1-65535")
+                # test free if not current
+                if str(v) != str(cur):
+                    s = socket.socket()
+                    s.bind(("0.0.0.0", v))
+                    s.close()
+                chosen = v
+            except OSError as e:
+                print(red(f"  ✗ port {raw} busy ({e})"))
+                return
+            except Exception as e:
+                print(red(f"  ✗ invalid port {raw!r}: {e}"))
+                return
+        was_running = bool(self.srv)
+        if was_running:
+            self.stop_server()
+        self.store.cfg_set("lan_port", chosen)
+        print(green(f"  ✓ port set to {chosen}"))
+        if was_running:
+            if self.start_server():
+                self.store.note(f"port changed to {chosen}")
+                print(green(f"  ● serving on http://{lan_ip()}:{chosen}/"))
+            else:
+                print(red("  ✗ failed to bind new port"))
 
     def do_server(self):
         if self.srv:
@@ -3619,6 +3957,10 @@ class Wizard:
         except EOFError:
             print()
 
+        # new vault or legacy vault without port: pick port (Enter=auto)
+        if self.store.cfg_get("lan_port") is None:
+            prompt_for_port(self.store)
+
         if not self.start_server():
             print(yellow("  continuing without network sharing"))
         else:
@@ -3661,7 +4003,12 @@ class Wizard:
         print(yellow("  cancelled (Ctrl+C again to quit)"))
 
     def do_copy(self):
-        q = self.ask("  copy link for (path or term): ").strip()
+        q = self.ask("  copy link [b]rowse vault or type path/term: ").strip()
+        if q.lower() in ("b", "browse"):
+            picked = vault_browse_picker(self.store, label="copy")
+            if not picked:
+                return
+            q = picked[0]
         if not q:
             return
         if not self.srv:
@@ -3709,15 +4056,41 @@ class Wizard:
     def dispatch(self, key):
         if os.environ.get("SMOLVAULT_DEBUG"):
             print(f"DEBUG dispatch key={key!r}", flush=True)
+        # library: offer vault browser if user hits 'b' at prompt inside? keep l paged, B for vault browser
+        def _do_library():
+            # tiny file manager add-on: ask vault browse vs paged
+            if sys.stdin.isatty() and sys.stdout.isatty() and _termios_available():
+                try:
+                    ans = self.ask("  library [p]aged or [b]rowse vault? [p/b]: ").strip().lower()
+                except QuitWizard:
+                    return
+                if ans in ("b", "browse"):
+                    picked = vault_browse_picker(self.store, label="library")
+                    if picked:
+                        # show info for picked file as preview
+                        show_info(self.store, picked[0])
+                    return
+            return list_library(self.store)
+        def _do_info():
+            # tiny manager add-on: [b]rowse vault
+            q = self.ask("  file [b]rowse vault or type path/term: ").strip()
+            if q.lower() in ("b", "browse"):
+                picked = vault_browse_picker(self.store, label="info")
+                if not picked:
+                    return
+                q = picked[0]
+            if q:
+                show_info(self.store, q)
         actions = {
             "a": self.do_add, "s": self.do_search,
             "p": self.do_play, "w": self.do_play,
-            "l": lambda: list_library(self.store),
+            "l": _do_library,
             "d": lambda: show_du(self.store.all_files(), self.store.stats()),
             "m": self.do_board,
-            "i": self.do_info,
+            "i": _do_info,
             "g": self.do_get, "c": self.do_copy,
             "y": self.do_sync, "S": self.do_server,
+            "P": self.do_port,
             "v": lambda: self._verify(),
         }
         if key in ("", "h", "help", "?"):
@@ -4246,6 +4619,17 @@ def run_client(spec, player=None):
                 continue
             try:
                 if key == "l":
+                    # tiny manager add-on: offer vault browser
+                    try:
+                        lb = input("  library [p]aged or [b]rowse vault? [p/b]: ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        lb = "p"
+                    if lb in ("b", "browse"):
+                        rows = _ensure_rows(rv)
+                        picked = vault_browse_picker(ListingStore(rows), label="library")
+                        if picked:
+                            remote_info(rv, picked[0])
+                        continue
                     rows = rv.rows = rv._fetch("/__api/list")
                     logical = sum(r["size"] for r in rows)
                     render_library(
@@ -4263,10 +4647,24 @@ def run_client(spec, player=None):
                     show_matches(matches)
                 elif key in ("p", "w"):
                     rows = _ensure_rows(rv)
-                    chosen = live_search(rows)
-                    if not chosen:
+                    if not rows:
+                        print(yellow("  (library is empty)"))
                         continue
-                    path, rrow = chosen
+                    # tiny vault browser for watch
+                    try:
+                        mode = input("  watch [b]rowse vault or [s]earch? [b/s]: ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        continue
+                    if mode in ("b", "browse"):
+                        picked = vault_browse_picker(ListingStore(rows), label="watch")
+                        if not picked:
+                            continue
+                        path, rrow = picked
+                    else:
+                        chosen = live_search(rows)
+                        if not chosen:
+                            continue
+                        path, rrow = chosen
                     mime = rrow.get("mime") or ""
                     if not mime.startswith(("video/", "audio/", "image/")):
                         print(yellow(f"  '{path}' is {mime} — not watchable. "
@@ -4285,11 +4683,23 @@ def run_client(spec, player=None):
                                [r["path"] for r in rows],
                                explicit_pl or "mpv")
                 elif key == "i":
-                    q = input("  file (path or term): ").strip()
+                    q = input("  file [b]rowse vault or type path/term: ").strip()
+                    if q.lower() in ("b", "browse"):
+                        rows = _ensure_rows(rv)
+                        picked = vault_browse_picker(ListingStore(rows), label="info")
+                        if not picked:
+                            continue
+                        q = picked[0]
                     if q:
                         remote_info(rv, q)
                 elif key == "g":
-                    q = input("  export which (path or term): ").strip()
+                    q = input("  export [b]rowse vault or type path/term: ").strip()
+                    if q.lower() in ("b", "browse"):
+                        rows = _ensure_rows(rv)
+                        picked = vault_browse_picker(ListingStore(rows), label="get")
+                        if not picked:
+                            continue
+                        q = picked[0]
                     if not q:
                         continue
                     out = input(dim("  save as? [default: same name]")
@@ -4464,7 +4874,7 @@ def build_parser():
             raise argparse.ArgumentTypeError(f"port {v} out of range 1-65535")
         return v
     ap.add_argument("--port", type=_port_type, default=None,
-                    help="port (default 8100, remembered per-vault)")
+                    help="port (default 8100, remembered per-vault; at vault creation Enter=auto next free; $SMOLVAULT_PORT)")
     ap.add_argument("-p", "--password", default="", help="vault password (or set via prompt; also unlocks encrypted vault)")
     ap.add_argument("-v", "--verbose", action="store_true", help="verbose logging")
     ap.add_argument("--check", action="store_true", help="verify chunks, exit")
@@ -4513,7 +4923,7 @@ def build_parser():
     mg.add_argument("--info", metavar="PATH_OR_Q", help="file details")
     mg.add_argument("--get", metavar="PATH_OR_Q", help="export a file")
     mg.add_argument("-o", "--out", help="output filename for --get")
-    ap.epilog = " env: SMOLVAULT_VAULT default vault, SMOLVAULT_PLAYER player, SMOLVAULT_SERVER default host:port, SMOLVAULT_NAME node name, SMOLVAULT_DEBUG verbose, NO_COLOR disable color"
+    ap.epilog = " env: SMOLVAULT_VAULT default vault, SMOLVAULT_PLAYER player, SMOLVAULT_SERVER default host:port, SMOLVAULT_NAME node name, SMOLVAULT_PORT default port at creation, SMOLVAULT_DEBUG verbose, NO_COLOR disable color"
     return ap
 
 
@@ -4633,6 +5043,11 @@ def main(argv=None):
     store = Store(vault)
     if created:
         print(green(f"  ✓ created {vault}"))
+        # new vault: pick port (Enter=auto next free, persists)
+        if store.cfg_get("lan_port") is None:
+            # respect CLI --port or SMOLVAULT_PORT, else interactive prompt
+            explicit = args.port if args.port is not None else None
+            prompt_for_port(store, explicit=explicit)
 
     if args.password:
         if not store.has_password():
