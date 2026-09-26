@@ -40,6 +40,16 @@ Highlights
 - Space report: --du breaks down folders, finds double-sealed files
 - Script-friendly: stable exit codes, SMOLVAULT_VAULT env var
 
+Cross-process safety
+--------------------
+A write lock only orders threads inside one process, so an ingest
+publishes a lease row (`ingest_lease`) before its first chunk lands.
+`--gc` in another terminal sees that lease and defers collection instead
+of deleting chunks the running seal still owns; leases older than
+LEASE_GRACE are reclaimed, so a `kill -9` mid-ingest self-heals. A
+truncated or hash-mismatched ingest is rolled back with `Store.drop_file`,
+which reclaims the chunks too rather than orphaning them into `stats()`.
+
 Quick start
 -----------
     python3 smolvault.py                  # wizard (creates vault.vault)
@@ -75,7 +85,7 @@ import zlib
 from collections import Counter, namedtuple
 from socketserver import ThreadingMixIn
 
-__version__ = "0.3.3"
+__version__ = "0.4.0"
 
 log = logging.getLogger("smolvault")
 
@@ -302,15 +312,23 @@ def mime_type(path):
 PutResult = namedtuple("PutResult", "size root_hash new_bytes new_chunks")
 
 def _parse_content_length(headers, max_len=None):
-    """Parse Content-Length from headers dict, return int or None. Returns (value, error_code)."""
+    """Parse Content-Length from a headers dict.
+
+    Returns ``(value, err)``. ``err is None`` means *value* is a usable
+    length. Otherwise *err* is the status to answer with (400 or 411) and
+    *value* is meaningless. A missing header returns ``(-1, 411)`` — the
+    -1 is a "no length" sentinel, never a usable length: callers must
+    check *err* first (every one does, and ``_Bounded`` asserts
+    ``length >= 0`` so a future refactor cannot seal a 0-byte file by
+    accident).
+    """
     raw = headers.get("Content-Length")
     if raw is None:
         return -1, 411  # missing
     raw = raw.strip()
-    try:
-        v = int(raw)
-    except (ValueError, TypeError):
+    if not raw.isdigit():          # rejects "bad", "-1" and "5_0" (int() would take the last)
         return None, 400
+    v = int(raw)
     if v < 0:
         return None, 400
     if max_len is not None and v > max_len:
@@ -471,9 +489,15 @@ class Store:
     readers run fully parallel against one writer. Ingest is deliberately
     single-threaded: on consumer CPUs (single-core turbo >> all-core) the
     GIL-bound chunker runs faster unpinned than under any worker pipeline —
-    measured, not assumed. The wins live in the write path instead."""
+    measured, not assumed. The wins live in the write path instead.
+
+    Cross-process safety: ``_wlock`` only orders threads *inside* one
+    process, so it cannot stop a ``--gc`` running in another terminal from
+    deleting chunks that an in-flight PUT has committed but not yet
+    referenced. ``ingest_lease`` closes that hole (see ``_put``/``gc``)."""
 
     DB_BATCH = 100              # chunks per transaction (DenseVault discipline)
+    LEASE_GRACE = 3600          # fallback age cap, for pid reuse
 
     def __init__(self, path):
         self.path = path
@@ -481,6 +505,17 @@ class Store:
         # WAL allows one writer; take it explicitly so contenders fail fast
         # (409) instead of stalling on lock timeouts.
         self._wlock = threading.Lock()
+        # key material is absent until unlock(); never leave these undefined
+        # so a stray access is a LockedVault, not an AttributeError
+        self._mk = self._ek = self._nk = self._msg_k = None
+        self._enc_on = None      # cached enc_enabled() flag
+        # An in-memory (or shared-cache URI) database is per-*connection*,
+        # so the thread-local scheme would hand every request thread a
+        # private, schema-less DB. Those are test-only: use one connection.
+        self._shared = (path == ":memory:"
+                        or path.startswith("file:") and "mode=memory" in path)
+        if self._shared:
+            self._shared_conn = self._new_conn(check_same_thread=False)
         conn = self.conn()
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
@@ -501,19 +536,36 @@ class Store:
                 sender TEXT NOT NULL,
                 kind TEXT NOT NULL DEFAULT 'user',
                 body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS ingest_lease (
+                path    TEXT PRIMARY KEY,
+                started REAL NOT NULL,
+                pid     INTEGER NOT NULL DEFAULT 0);
         """)
         conn.commit()
 
+    def _new_conn(self, check_same_thread=True):
+        c = sqlite3.connect(self.path, timeout=2.0,
+                            check_same_thread=check_same_thread)
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        c.execute("PRAGMA mmap_size=536870912")
+        # A *cap*, not a reservation — SQLite grows the page cache lazily, so
+        # a connection only holds what it actually touches. Cutting it to
+        # 2 MB was measured and reverted: with a chunks index past the cap
+        # (~300k chunks) range reads went p50 1.6 -> 4.9 ms, p95 7.1 -> 12.7
+        # (fresh process per setting, identical warm-up). Seeks are the
+        # point of a media server.
+        c.execute("PRAGMA cache_size=-64000")
+        c.execute("PRAGMA temp_store=MEMORY")
+        c.row_factory = sqlite3.Row
+        return c
+
     def conn(self):
+        if self._shared:
+            return self._shared_conn
         c = getattr(self._local, "conn", None)
         if c is None:
-            c = sqlite3.connect(self.path, timeout=2.0)
-            c.execute("PRAGMA journal_mode=WAL")
-            c.execute("PRAGMA synchronous=NORMAL")
-            c.execute("PRAGMA mmap_size=536870912")
-            c.execute("PRAGMA cache_size=-64000")
-            c.execute("PRAGMA temp_store=MEMORY")
-            c.row_factory = sqlite3.Row
+            c = self._new_conn()
             self._local.conn = c
         return c
 
@@ -577,7 +629,11 @@ class Store:
         return {k: v for k, v in rows} or None
 
     def enc_enabled(self):
-        return self._enc_cfg() is not None
+        # cached: this sat on the per-chunk path (via _seal/_open), so a
+        # 100k-chunk file issued 100k extra config queries
+        if self._enc_on is None:
+            self._enc_on = self._enc_cfg() is not None
+        return self._enc_on
 
     def is_unlocked(self):
         if not self.enc_enabled():
@@ -613,44 +669,77 @@ class Store:
                       [("enc_ver", "1"), ("enc_alg", "aesgcm256"),
                        ("enc_salt", salt.hex()), ("enc_mk", blob)])
         c.commit()
+        self._enc_on = True
         self._load_keys(mk)
 
     def disable_encryption(self, password):
-        """Strip envelopes from all chunks (caller migrates first) and
-        remove key material."""
+        """Strip the key material once every chunk is plaintext again.
+
+        The caller must migrate first. Dropping the keys while envelopes
+        remain used to be silent, irreversible data loss: every later read
+        reported "authentication failed — tampered or wrong key" while the
+        board stayed perfectly readable. Now it refuses.
+        """
         self.unlock(password)
+        left = self.count_encrypted()
+        if left:
+            raise ValueError(
+                f"{left} chunk(s) still encrypted — run --decrypt first")
         c = self.conn()
         c.execute("DELETE FROM config WHERE key LIKE 'enc_%'")
         c.commit()
-        for attr in ("_mk", "_ek", "_nk"):
+        for attr in ("_mk", "_ek", "_nk", "_msg_k"):
             setattr(self, attr, None)
+        self._enc_on = False
+
+    # `hex(substr(data,1,5))` copies 5 bytes; the old `substr(hex(data),1,10)`
+    # materialised a 2x-blob-size string for every row just to compare 5.
+    _ENC_PRED = ("hex(substr(data,1,5))<>"
+                 "'5356454E01'")      # ENC_MAGIC b"SVEN\x01" in hex
+
+    def count_encrypted(self):
+        return self.conn().execute(
+            "SELECT COUNT(*) FROM chunks WHERE "
+            "hex(substr(data,1,5))='5356454E01'").fetchone()[0]
 
     def migrate_encryption(self, progress=None):
-        """Encrypt every legacy plaintext chunk in place. Resumable: blobs
-        already carrying the SVEN magic are skipped. Returns count."""
+        """Encrypt every legacy plaintext chunk in place.
+
+        Resumable: the rowid cursor is persisted in `config`, so an
+        interrupted run continues where it stopped instead of rescanning
+        the whole table. Chunks already carrying the SVEN magic are skipped.
+        Returns the number rewritten.
+        """
         if not self.enc_enabled():
             raise LockedVault("vault is not encrypted")
         if not self.is_unlocked():
             raise LockedVault("vault is locked — unlock() first")
         c = self.conn()
-        pred = (f"substr(hex(data),1,{len(self.ENC_MAGIC)*2})"
-                f"<>'{self.ENC_MAGIC.hex().upper()}'")
-        total = c.execute(
-            f"SELECT COUNT(*) FROM chunks WHERE {pred}").fetchone()[0]
-        done = 0
+        total = c.execute("SELECT COUNT(*) FROM chunks WHERE "
+                          + self._ENC_PRED).fetchone()[0]
+        done = int(self.cfg_get("enc_cursor", 0) or 0)
         while True:
+            # keyset pagination: one forward pass, not one pass per batch
             rows = c.execute(
-                f"SELECT hash, data FROM chunks WHERE {pred} LIMIT ?",
-                (self.DB_BATCH,)).fetchall()
+                f"SELECT rowid, hash, data FROM chunks "
+                f"WHERE rowid > ? AND {self._ENC_PRED} "
+                f"ORDER BY rowid LIMIT ?", (done, self.DB_BATCH)).fetchall()
             if not rows:
                 break
-            for h, data in rows:
-                c.execute("UPDATE chunks SET data=? WHERE hash=?",
-                          (self._seal(data, h), h))
-            c.commit()
-            done += len(rows)
+            c.execute("BEGIN TRANSACTION")
+            try:
+                for rowid, h, data in rows:
+                    c.execute("UPDATE chunks SET data=? WHERE hash=?",
+                              (self._seal(data, h), h))
+                    done = rowid
+                c.commit()
+            except Exception:
+                c.rollback()
+                raise
+            self.cfg_set("enc_cursor", done)
             if progress:
                 progress(done, total)
+        self.cfg_set("enc_cursor", 0)
         return done
 
     def _kek(self, password, salt):
@@ -776,14 +865,31 @@ class Store:
 
     # ---- write ---------------------------------------------------------------
 
-    def _flush_chunks(self, conn, batch, new_stored):
+    def _flush_chunks(self, conn, batch, new_stored, lease=None):
         """One explicit transaction per batch (keeps WAL checkpoints flowing
         instead of deferring a multi-GB commit). Per-row rowcount yields
-        exact new-byte accounting with no lookup queries at all."""
+        exact new-byte accounting with no lookup queries at all.
+
+        *lease* rides along in the **first** batch's transaction, so the
+        ingest lease becomes visible to a concurrent --gc at exactly the
+        instant the chunks it protects do. Atomic cross-table visibility
+        means gc can never see protected chunks without the lease.
+
+        Committing the lease separately instead measured -21% on 1500
+        small files (768 -> 606 files/s, 6 rotated passes) because it made
+        7 commits per 300 MB put where 5 suffice, and nearly tripled the
+        commit count for a 1-chunk file. Folding it in costs 2 extra
+        statements and no extra commit: still -8% on small files, and below
+        the noise floor on media (where pass-to-pass spread exceeds 2x and
+        the no-lease arm cannot be distinguished from either variant)."""
         if not batch:
             return
         conn.execute("BEGIN TRANSACTION")
         try:
+            if lease is not None:
+                conn.execute(
+                    "INSERT OR REPLACE INTO ingest_lease VALUES (?,?,?)",
+                    (lease, time.time(), os.getpid()))
             for h, (stored, comp) in batch.items():
                 cur = conn.execute("INSERT OR IGNORE INTO chunks VALUES (?,?,?)",
                                    (h, stored, comp))
@@ -808,7 +914,38 @@ class Store:
         c = self.conn()
         if c.execute("SELECT 1 FROM files WHERE path=?", (path,)).fetchone():
             raise ExistsError(path)
+        try:
+            return self._put_locked(c, path, reader, progress)
+        except BaseException:
+            # A put that dies mid-stream may have committed some batches (and
+            # with them the lease). Clear it here rather than relying on the
+            # pid dying, or a long-lived server would block its own --gc.
+            # Whatever chunks landed are left for gc, exactly as after a crash.
+            self._drop_file(path)     # _wlock is already held here
+            raise
 
+    @staticmethod
+    def _pid_alive(pid):
+        if not pid:
+            return False               # legacy row, or a bad write
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True                # exists, just not ours
+        except OSError:
+            return True                # be conservative
+
+    def _put_locked(self, c, path, reader, progress):
+        # gc() in another process cannot see _wlock, so the ingest lease is
+        # the only thing telling it that the chunks appearing over the next
+        # few minutes belong to a live writer. It is written inside the
+        # first batch's transaction rather than committed separately: atomic
+        # cross-table visibility means gc can never see protected chunks
+        # without the lease, and it costs no extra commit.
+        leased = False
         hashes, sizes, offsets = [], [], []
         off = 0
         batch = {}                            # hash -> (stored, comp), ordered
@@ -836,23 +973,80 @@ class Store:
             sizes.append(len(raw))
             off += len(raw)
             if len(batch) >= self.DB_BATCH:
-                self._flush_chunks(c, batch, new_stored)
+                # the lease rides along with the very first batch
+                self._flush_chunks(c, batch, new_stored,
+                                   lease=path if not leased else None)
+                leased = True
                 batch = {}
-        self._flush_chunks(c, batch, new_stored)
+        self._flush_chunks(c, batch, new_stored,
+                           lease=path if not leased else None)
 
         root = hashlib.blake2b("".join(hashes).encode(),
                                digest_size=32).hexdigest()
         manifest = json.dumps({"chunks": hashes, "sizes": sizes,
                                "offsets": offsets})
+        # the files row and the lease removal commit together, so a reader
+        # never observes a completed file whose lease is still live
         try:
+            c.execute("BEGIN TRANSACTION")
             c.execute(
                 "INSERT INTO files (path,size,root_hash,mime,manifest) "
                 "VALUES (?,?,?,?,?)",
                 (path, off, root, mime_type(path), manifest))
+            c.execute("DELETE FROM ingest_lease WHERE path=?", (path,))
             c.commit()
         except sqlite3.IntegrityError:
-            raise ExistsError(path)       # lost a WORM race with another conn
+            c.rollback()
+            self._drop_file(path)     # lost a WORM race: don't leak our chunks
+            raise ExistsError(path)
         return PutResult(off, root, new_stored[0], len(hashes))
+
+    def drop_file(self, path):
+        """Remove a file row *and* the chunks nothing else references.
+
+        A bare `DELETE FROM files` left every chunk that path had written
+        orphaned, so `stats()` and `--du` overstated the vault until someone
+        remembered to run --gc. Any ingest lease for the path goes too."""
+        with self._wlock:
+            return self._drop_file(path)
+
+    def _drop_file(self, path):
+        """Caller already holds _wlock (threading.Lock is not reentrant, so
+        the ingest path must use this directly, not drop_file)."""
+        c = self.conn()
+        row = c.execute("SELECT manifest FROM files WHERE path=?",
+                        (path,)).fetchone()
+        if not row:
+            self._clear_lease(c, path)
+            return False
+        try:
+            c.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            c.execute("DELETE FROM files WHERE path=?", (path,))
+            c.execute("DELETE FROM ingest_lease WHERE path=?", (path,))
+            live = set()
+            for (m,) in c.execute("SELECT manifest FROM files"):
+                live.update(json.loads(m)["chunks"])
+            orphans = [h for h in json.loads(row["manifest"])["chunks"]
+                       if h not in live]
+            if orphans:
+                c.executemany("DELETE FROM chunks WHERE hash=?",
+                              [(h,) for h in orphans])
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+        return True
+
+    @staticmethod
+    def _clear_lease(c, path):
+        try:
+            c.execute("DELETE FROM ingest_lease WHERE path=?", (path,))
+            c.commit()
+        except sqlite3.Error:
+            pass
 
     # ---- read ---------------------------------------------------------------
 
@@ -861,12 +1055,17 @@ class Store:
             "SELECT * FROM files WHERE path=?", (path,)).fetchone()
 
     def list_dir(self, prefix):
-        """Children (subdirs, files) of *prefix*, derived from file paths."""
+        """Children (subdirs, files) of *prefix*, derived from file paths.
+
+        Uses a range scan on the primary key. `substr(path,1,?)` compiles to
+        a whole-index scan, so every 404 and every directory page cost O(n).
+        """
         c = self.conn()
         n = len(prefix)
         rows = c.execute(
             "SELECT path, size, mime, created_at FROM files "
-            "WHERE substr(path, 1, ?) = ?", (n, prefix)).fetchall()
+            "WHERE path >= ? AND path < ?",
+            (prefix, prefix + "\U0010FFFF")).fetchall()
         dirs, files = set(), []
         for r in rows:
             rest = r["path"][n:]
@@ -971,15 +1170,45 @@ class Store:
         return ok
 
     def gc(self):
-        # single-writer lock prevents race with concurrent PUT (C2)
+        # _wlock orders threads in *this* process only. Cross-process safety
+        # comes from ingest_lease: a PUT running in another process has
+        # already committed chunks that no `files` row references yet, and
+        # collecting them would corrupt the file the moment its row lands.
         with self._wlock:
             c = self.conn()
+            now = time.time()
+            # A crashed ingest leaves its lease behind. Two ways to tell:
+            # the owning pid is gone (the usual case, and immediate), or the
+            # lease is simply too old to trust (covers pid reuse).
+            stale = [r[0] for r in c.execute("SELECT path, started, pid "
+                                             "FROM ingest_lease")
+                     if not self._pid_alive(r[2])
+                     or now - r[1] > self.LEASE_GRACE]
+            if stale:
+                c.executemany("DELETE FROM ingest_lease WHERE path=?",
+                              [(p,) for p in stale])
+                c.commit()
+                log.info("gc: reclaimed %d stale ingest lease(s)", len(stale))
+            leased = {r[0] for r in c.execute(
+                "SELECT path FROM ingest_lease")}
+            if leased:
+                # An ingest is committing chunks that no `files` row
+                # references yet. There is nothing to distinguish them from
+                # orphans, so defer collection entirely and say so.
+                log.warning("gc: %d ingest(s) in flight (%s) — "
+                            "collection deferred, run again when idle",
+                            len(leased), ", ".join(sorted(leased)[:3]))
+                return
             # use IMMEDIATE to fail fast if another process holds write lock
             try:
                 c.execute("BEGIN IMMEDIATE")
-            except sqlite3.OperationalError:
-                log.warning("gc: vault busy, skipped")
-                return
+            except sqlite3.OperationalError as e:
+                if "within a transaction" in str(e):
+                    c.commit()           # stale implicit txn, not a busy vault
+                    c.execute("BEGIN IMMEDIATE")
+                else:
+                    log.warning("gc: vault busy, skipped")
+                    return
             try:
                 referenced = set()
                 for (manifest,) in c.execute("SELECT manifest FROM files"):
@@ -1008,26 +1237,46 @@ class RangeError(Exception):
     pass
 
 
+def _etag_canon(value):
+    """Normalize an ETag for comparison: strip an optional *case-insensitive*
+    W/ prefix and the quotes. `W/` is case-insensitive per RFC 7232/7405 —
+    a case-sensitive strip made `w/"..."` miss and forced a full re-download.
+    """
+    v = value.strip()
+    if v[:2].upper() == "W/":
+        v = v[2:]
+    return v.strip().strip('"')
+
+
 def parse_range(header, size):
     """
     Parse a single-range `bytes=` header. Returns (start, end) inclusive,
     None to ignore the header (serve 200), raises RangeError for 416.
     """
+    if size <= 0:
+        # nothing is satisfiable; without this a suffix range on a 0-byte
+        # file answered 206 with the nonsense Content-Range "bytes 0--1/0"
+        raise RangeError()
     m = _RANGE_RE.fullmatch(header)
     if not m:
         return None                      # multi-range/other units: ignore
     a, b = m.group(1), m.group(2)
     if a == "" and b == "":
         return None
-    if a == "":                          # suffix: final b bytes
-        n = int(b)
-        if n == 0:
+    try:
+        if a == "":                      # suffix: final b bytes
+            n = int(b)
+            if n == 0:
+                raise RangeError()
+            return (max(0, size - n), size - 1)
+        start = int(a)
+        if start >= size:
             raise RangeError()
-        return (max(0, size - n), size - 1)
-    start = int(a)
-    if start >= size:
+        end = int(b) if b else size - 1
+    except ValueError:
+        # e.g. a 5000-digit number: CPython refuses the int() outright and
+        # the unguarded ValueError killed the connection with no response
         raise RangeError()
-    end = int(b) if b else size - 1
     if end < start:
         raise RangeError()               # RFC 7233: unsatisfiable
     return (start, min(end, size - 1))
@@ -1099,6 +1348,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"        # keep-alive: cheap scrubbing
     server_version = "smolvault/" + __version__
     wbufsize = 256 * 1024
+    # Without this the socket never times out, so a stalled upload holds
+    # Store._wlock (taken before the body is read) for as long as the
+    # client cares to hang around. BaseHTTPRequestHandler turns the
+    # resulting TimeoutError into close_connection for us.
+    timeout = 60
 
     @property
     def store(self):
@@ -1131,7 +1385,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          bold(f"{self.command or '-':<7}"),
                          color(f"{code}"),
                          cyan(fmt(sent).rjust(9)),
-                         (self.path or "-")[:60],
+                         (getattr(self, "path", None) or "-")[:60],
                          dim(f"{dur:.0f}ms"))
 
     def send_response(self, code, message=None):
@@ -1140,6 +1394,74 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):     # silence default logger
         pass
+
+    # ---- request framing (CL.CL / TE desync) ------------------------------
+
+    def parse_request(self):
+        """Reject ambiguous framing *before* any handler runs.
+
+        http.server ignores Transfer-Encoding entirely and hands back only
+        the first Content-Length, so without this a rejected request left
+        its body in the socket to be parsed as the *next* request -- the
+        classic smuggling primitive behind a reverse proxy.
+        """
+        if not super().parse_request():
+            return False
+        if self.headers.get("Transfer-Encoding"):
+            return self._framing_error(
+                501, b"Transfer-Encoding is not supported\n")
+        lengths = self.headers.get_all("Content-Length") or []
+        if len(lengths) > 1 and len({v.strip() for v in lengths}) > 1:
+            return self._framing_error(
+                400, b"conflicting Content-Length headers\n")
+        if len(lengths) > 1:                # identical duplicates: harmless
+            self.headers.replace_header("Content-Length", lengths[0].strip())
+        return True
+
+    def _framing_error(self, code, body):
+        self.close_connection = True      # never reuse a desynced stream
+        self._head(code, len(body), extra={"Connection": "close",
+                                           "Content-Type": "text/plain"})
+        self.end_headers()
+        if self.command != "HEAD":
+            try:
+                self.wfile.write(body)
+            except OSError:
+                pass
+        return False
+
+    # ---- error replies -----------------------------------------------------
+
+    def _fail(self, code, body=b"", close=False, ctype="text/plain"):
+        """Answer with *body* and a matching Content-Length.
+
+        Every error path funnels through here: announcing
+        ``Content-Length: 0`` and then writing a body desynchronises
+        HTTP/1.1 keep-alive, and the next request on the socket is read
+        out of the middle of our own payload.
+        """
+        if close:
+            self.close_connection = True
+        self._head(code, len(body), extra={
+            "Content-Type": ctype, "Connection": "close"} if close
+            else {"Content-Type": ctype})
+        self.end_headers()
+        if body and self.command != "HEAD":
+            try:
+                self.wfile.write(body)
+            except OSError:
+                pass
+        return code
+
+    def _locked_423(self):
+        """423 for an encrypted-but-unlocked vault. HEAD never carries a
+        body (RFC 7230 3.3.3)."""
+        return self._fail(423, b"vault locked\n", close=True)
+
+    def _not_found(self):
+        # a drained, correctly-lengthed 404: send_error() sets
+        # Connection: close, which tears down a client's keep-alive pool
+        return self._fail(404, b"404 not found\n")
 
     # ---- auth ---------------------------------------------------------------
 
@@ -1158,9 +1480,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return True
         except Exception:
             pass
+        # close rather than drain: we never read the body on this path
+        self.close_connection = True
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="smolvault"')
         self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
         self.end_headers()
         return False
 
@@ -1184,30 +1509,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "Accept-Ranges": "bytes"})
         self.end_headers()
 
+    def _locked(self):
+        return self.store.enc_enabled() and not self.store.is_unlocked()
+
     def do_PUT(self):
         if not self._authed():
             return
+        if self._locked():             # gate before anything touches data
+            return self._locked_423()
         norm = _norm(self.path)
         length, err = _parse_content_length(self.headers)
         if err:
-            self._head(err, 0, extra={"Connection": "close"})
-            self.close_connection = True
-            self.end_headers(); return
-        # allow 0-byte files (H2 parity)
-        # length==0 is valid: empty file
+            return self._fail(err, b"bad or missing Content-Length\n",
+                              close=True)
+        # allow 0-byte files (H2 parity); length==0 is a valid empty file
         reader = _Bounded(self.rfile, length)
         try:
             res = self.store.put(norm, reader)
         except ExistsError:
             log.warning(gray("WORM rejected overwrite of %s"), norm)
-            body = b"sealed: already exists\n"
-            self._head(409, len(body),
-                       extra={"Content-Type": "text/plain",
-                              "Connection": "close"})
-            self.close_connection = True
-            self.end_headers()
-            self.wfile.write(body)
-            return
+            return self._fail(409, b"sealed: already exists\n", close=True)
         except sqlite3.OperationalError as e:
             log.error(red("db busy on PUT %s: %s"), norm, e)
             self._head(503, 0, extra={"Retry-After": "2",
@@ -1216,57 +1537,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         except LockedVault:
-            body = b"vault locked\n"
-            self._head(423, len(body), extra={"Content-Type": "text/plain",
-                                      "Connection": "close"})
-            self.close_connection = True
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        # C1: verify Content-Length fully consumed; truncated PUT must not seal (detect via store size vs length)
+            return self._locked_423()
+        except Exception as e:         # _Crypto / AttributeError -> 500, never a reset
+            log.error(red("PUT %s failed: %s"), norm, e)
+            return self._fail(500, b"seal failed\n", close=True)
+        # C1: a truncated upload must not seal. Drop the files row *and*
+        # the chunks it left orphaned (a bare DELETE FROM files leaked
+        # them into stats() until the next --gc).
         if length != res.size:
-            # If client sent less/more than declared, remove the partial file and signal error
-            # truncated/short read: manifest size differs from declared length
-            try:
-                self.store.conn().execute("DELETE FROM files WHERE path=?", (norm,))
-                self.store.conn().commit()
-            except Exception:
-                pass
-            log.error(red("truncated PUT %s: declared %d got %d"), norm, length, res.size)
-            body = b"truncated upload\n"
-            self._head(400, len(body), extra={"Content-Type": "text/plain",
-                                      "Connection": "close"})
-            self.close_connection = True
-            self.end_headers()
-            self.wfile.write(body)
-            return
+            log.error(red("truncated PUT %s: declared %d got %d"),
+                      norm, length, res.size)
+            self.store.drop_file(norm)
+            return self._fail(400, b"truncated upload\n", close=True)
         dedup = f"{res.new_bytes/res.size*100:.0f}% new" if res.size else "0% new"
         log.info("%s %s  (%s) · %s", green("sealed"), norm, fmt(res.size),
                  gray(dedup))
-        self._head(201, 0, extra={"ETag": f'"{res.root_hash}"'})
+        self._head(201, 0, extra={"ETag": f'"{res.root_hash}"',
+                                  "Location": urllib.parse.quote(norm)})
         self.end_headers()
 
     def do_DELETE(self):
         if not self._authed():
             return
-        self._head(403, 0, extra={"Content-Type": "text/plain"})
-        self.end_headers()
-        self.wfile.write(b"WORM: deletion disabled\n")
+        return self._fail(403, b"WORM: deletion disabled\n")
 
     def do_HEAD(self):
         if not self._authed():
             return
-        if self.store.enc_enabled() and not self.store.is_unlocked():
-            body = b"vault locked\n"
-            self._head(423, len(body), extra={"Content-Type": "text/plain", "Connection": "close"})
-            self.close_connection = True
-            self.end_headers()
-            self.wfile.write(body)
-            return
+        if self._locked():
+            return self._locked_423()
         row = self.store.lookup(_norm(self.path))
         if not row:
-            self.send_error(404)
-            return
+            if _is_dir(self.store, self.path):
+                return self._fail(200)   # a directory has no body to HEAD
+            return self._not_found()
         self._head(200, row["size"], row["root_hash"], row["mime"],
                    {"Accept-Ranges": "bytes", "Cache-Control": CACHE})
         self.end_headers()
@@ -1274,6 +1578,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._authed():
             return
+        # Gate first, dispatch second. This check used to sit *below* the
+        # /__api/* dispatch, so GET /__api/list answered 200 with every
+        # path, size, mime and root_hash while file bodies correctly 423'd.
+        if self._locked():
+            return self._locked_423()
         parsed = urllib.parse.urlparse(self.path)
         pnorm = _norm(parsed.path)
         if pnorm == "/__api/list":
@@ -1293,40 +1602,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if _is_dir(self.store, self.path):
                 self._dir_page()
                 return
-            self.send_error(404)
-            return
-        if self.store.enc_enabled() and not self.store.is_unlocked():
-            body = b"vault locked\n"
-            self._head(423, len(body), extra={"Content-Type": "text/plain", "Connection": "close"})
-            self.close_connection = True
-            self.end_headers()
-            self.wfile.write(body)
-            return
+            return self._not_found()
 
         etag = row["root_hash"]
+        base_extra = {"Accept-Ranges": "bytes", "Cache-Control": CACHE}
         inm = self.headers.get("If-None-Match")
         if inm:
-            candidates = [t.strip().removeprefix("W/").strip('"')
-                          for t in inm.split(",")]
-            if etag in candidates:
-                self._head(304, 0, etag)
+            candidates = [_etag_canon(t) for t in inm.split(",")]
+            if "*" in candidates or etag in candidates:
+                # RFC 7230 3.3.2: no Content-Length on a 304
+                self._head(304, None, etag, extra=base_extra)
                 self.end_headers()
                 return
 
-        base_extra = {"Accept-Ranges": "bytes", "Cache-Control": CACHE}
         rng_hdr = self.headers.get("Range")
 
         if_rng = self.headers.get("If-Range")
         if_rng_ok = True
         if if_rng:
-            # handle weak ETag W/"..." and strip quotes
-            cand = if_rng.strip().removeprefix("W/").strip().strip('"')
-            # if it's a date, ignore range (serve 200)
-            # simple heuristic: dates contain comma
-            if "," in if_rng and cand != etag:
-                if_rng_ok = False
-            elif cand != etag:
-                if_rng_ok = False
+            # a weak or date-valued If-Range that doesn't match means
+            # "ignore the Range and send the whole thing"
+            if_rng_ok = (_etag_canon(if_rng) == etag)
         if rng_hdr and if_rng_ok:
             try:
                 rng = parse_range(rng_hdr, row["size"])
@@ -1383,7 +1679,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             since = int(q.get("since", ["0"])[0] or 0)
             limit = int(q.get("limit", ["100"])[0] or 100)
         except ValueError:
-            self._head(400, 0); self.end_headers(); return
+            return self._fail(400, b"bad since/limit\n")
         rows = self.store.msgs_since(since, limit)
         payload = json.dumps({
             "messages": [{"id": r["id"], "ts": r["ts"], "sender": r["sender"],
@@ -1399,23 +1695,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sr = self.store.cfg_get("share_root")
         return os.path.realpath(sr) if sr else None
 
+    @staticmethod
+    def _contained(root, path):
+        """True when *path* is inside *root*. os.path.commonpath raises
+        ValueError on mixed absolute/relative input and on Windows when the
+        two paths sit on different drives -- both must read as 'escape'."""
+        try:
+            return os.path.commonpath([os.path.realpath(path), root]) == root
+        except (ValueError, OSError):
+            return False
+
     def _api_browse(self):
         """GET /__api/browse?dir=REL — listing under --share-root."""
         sr = self._share_root()
         if not sr:
-            self._head(403, 0, extra={"Content-Type": "text/plain"})
-            self.end_headers()
-            self.wfile.write(b"share root not enabled on this vault\n")
-            return
+            return self._fail(403, b"share root not enabled on this vault\n")
         q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         rel = q.get("dir", [""])[0]
         want_files = q.get("recursive", ["0"])[0] == "1"
         target = os.path.realpath(os.path.join(sr, rel.lstrip("/")))
-        if os.path.commonpath([target, sr]) != sr:
-            self._head(403, 0, extra={"Content-Type": "text/plain"})
-            self.end_headers()
-            self.wfile.write(b"path escapes share root\n")
-            return
+        if not self._contained(sr, target):
+            return self._fail(403, b"path escapes share root\n")
+        truncated = False
         if want_files:
             files = []
             for dp, dns, fns in os.walk(target):
@@ -1424,13 +1725,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 for fn in fns:
                     if fn.startswith("."):
                         continue
+                    if len(files) >= MAX_INGEST_JOBS:
+                        # unbounded: one dir= on a big tree would build a
+                        # multi-hundred-MB JSON body
+                        truncated = True
+                        dns[:] = []
+                        break
                     p = os.path.join(dp, fn)
                     if os.path.isfile(p):
                         files.append({
                             "path": os.path.relpath(p, sr).replace(os.sep, "/"),
                             "size": os.path.getsize(p)})
             files.sort(key=lambda x: natural_key(x["path"]))
-            payload = json.dumps({"files": files}).encode()
+            payload = json.dumps({"files": files,
+                                  "truncated": truncated}).encode()
         else:
             entries = [{"name": n, "is_dir": is_d, "size": s}
                        for n, is_d, s in scan_dir(target)]
@@ -1447,28 +1755,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
         files under --share-root into this vault (additive WORM)."""
         sr = self._share_root()
         if not sr:
-            self._head(403, 0, extra={"Content-Type": "text/plain"})
-            self.end_headers()
-            self.wfile.write(b"share root not enabled on this vault\n")
-            return
+            return self._fail(403, b"share root not enabled on this vault\n")
         length, err = _parse_content_length(self.headers, max_len=262144)
         if err or length <= 0:
-            self._head(400, 0); self.end_headers(); return
+            return self._fail(400, b"bad or missing Content-Length\n",
+                              close=True)
         try:
             req = json.loads(self.rfile.read(length))
+            if not isinstance(req, dict):
+                raise ValueError("object expected")
             raw_paths = req.get("paths", [])
             if not isinstance(raw_paths, list):
                 raise ValueError("paths must be list")
             if len(raw_paths) > MAX_INGEST_PATHS:
-                payload = json.dumps({"error": f"too many paths (max {MAX_INGEST_PATHS})"}).encode()
-                self._head(400, len(payload), None, "application/json"); self.end_headers(); self.wfile.write(payload); return
+                return self._json_error(
+                    400, f"too many paths (max {MAX_INGEST_PATHS})")
             rels = [str(p) for p in raw_paths]
             into = str(req.get("into", "/")) or "/"
-        except (ValueError, json.JSONDecodeError):
-            self._head(400, 0); self.end_headers(); return
+        except (ValueError, json.JSONDecodeError) as e:
+            return self._fail(400, f"bad ingest request: {e}\n".encode(),
+                              close=True)
+        except LockedVault:
+            return self._locked_423()
 
         def contained(p):
-            return os.path.commonpath([p, sr]) == sr
+            return self._contained(sr, p)
 
         def queue(abs_target):
             """Expand one accepted path into (abs_file, rel_label) jobs.
@@ -1528,8 +1839,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 results.append({"path": rel, "status": 404})
 
         if len(jobs) > MAX_INGEST_JOBS:
-            payload = json.dumps({"error": f"too many files (max {MAX_INGEST_JOBS})"}).encode()
-            self._head(400, len(payload), None, "application/json"); self.end_headers(); self.wfile.write(payload); return
+            return self._json_error(
+                400, f"too many files (max {MAX_INGEST_JOBS})")
         for abs_f, dest, rel_f in jobs:
             try:
                 with open(abs_f, "rb") as f:
@@ -1540,13 +1851,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
                          dest, fmt(res.size))
             except ExistsError:
                 results.append({"path": rel_f, "status": 409, "dest": dest})
+            except LockedVault:
+                return self._locked_423()
             except OSError as e:
+                results.append({"path": rel_f, "status": 500, "error": str(e)})
+            except Exception as e:        # never a bare connection reset
+                log.error(red("remote ingest %s: %s"), dest, e)
                 results.append({"path": rel_f, "status": 500, "error": str(e)})
         payload = json.dumps({"results": results}).encode()
         self._head(200, len(payload), None, "application/json",
                    {"Cache-Control": "no-store"})
         self.end_headers()
         self.wfile.write(payload)
+
+    def _json_error(self, code, msg):
+        payload = json.dumps({"error": msg}).encode()
+        self._head(code, len(payload), None, "application/json",
+                   {"Cache-Control": "no-store"})
+        self.end_headers()
+        self.wfile.write(payload)
+        return code
 
     def _api_auth_state(self):
         payload = json.dumps({
@@ -1561,26 +1885,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._authed():
             return
-        norm = urllib.parse.urlparse(self.path).path
-        norm = _norm(norm)
+        if self._locked():             # gate before touching messages/ingest
+            return self._locked_423()
+        norm = _norm(urllib.parse.urlparse(self.path).path)
         length, err = _parse_content_length(self.headers)
         if norm == "/__api/ingest":
             if err or length <= 0 or length > 262144:
-                self._head(400, 0); self.end_headers(); return
-            self._api_ingest()
-            return
-        if norm != "/__api/msg" or err or length <= 0 or length > 16384:
-            self._head(400, 0); self.end_headers(); return
+                return self._fail(400, b"bad ingest Content-Length\n",
+                                  close=True)
+            return self._api_ingest()
+        if norm != "/__api/msg" or err or not (1 <= length <= 16384):
+            return self._fail(400, b"bad request\n", close=True)
         try:
-            body = json.loads(self.rfile.read(length)).get("body", "")
+            payload_obj = json.loads(self.rfile.read(length))
+            if not isinstance(payload_obj, dict):
+                # [] / null / 5 used to raise AttributeError and drop the
+                # connection with no response at all
+                raise ValueError("object expected")
+            body = payload_obj.get("body", "")
             mid = self.store.post_msg(self.headers.get("X-Smv-Name")
                                       or _node_name(), "user", body)
         except (ValueError, json.JSONDecodeError) as e:
-            payload = json.dumps({"error": str(e)}).encode()
-            self._head(400, len(payload), None, "application/json")
-            self.end_headers()
-            self.wfile.write(payload)
-            return
+            return self._json_error(400, str(e))
+        except LockedVault:
+            return self._locked_423()
+        except UnicodeDecodeError:
+            return self._json_error(400, "body must be valid UTF-8")
         payload = json.dumps({"id": mid}).encode()
         self._head(201, len(payload), None, "application/json")
         self.end_headers()
@@ -1623,6 +1953,9 @@ class _Bounded:
 class MediaServer(ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # the stdlib default of 5 drops SYNs from a player that opens several
+    # range connections at once
+    request_queue_size = 128
 
 
 DISCOVERY_PORT = 8100          # UDP; answers SMOLVAULT_DISCOVER probes
@@ -2011,7 +2344,10 @@ def vault_stats_line(s):
         tail = "" if s.get("stored") else " (remote: stored n/a)" \
             if s.get("remote") else ""
         return f"{s['files']} files · {fmt(s['logical'])} logical{tail}"
-    dedup = 100 - s["stored"] / s["logical"] * 100
+    # stored can exceed logical (encryption envelope, tiny files), so clamp
+    # rather than print a nonsense "-3300% deduped"
+    dedup = max(0.0, 100 - s["stored"] / s["logical"] * 100) \
+        if s.get("logical") else 0.0
     return (f"{s['files']} files · {fmt(s['logical'])} logical · "
             f"{fmt(s['stored'])} stored · {dedup:.0f}% deduped")
 
@@ -2102,7 +2438,7 @@ def show_du(rows, stats=None):
     if stats:
         dedup = 0
         if stats.get("logical"):
-            dedup = 100 - stats["stored"] / stats["logical"] * 100
+            dedup = max(0.0, 100 - stats["stored"] / stats["logical"] * 100)
         print(dim(f"  ── vault: {fmt(stats['logical'])} logical · "
                   f"{fmt(stats['stored'])} stored · {dedup:.0f}% deduped"))
 
@@ -2464,6 +2800,15 @@ def live_search(rows, player_label="watch", multi=False):
     old = termios.tcgetattr(fd)
     query, sel = "", 0
     checked, chosen = set(), None
+    matches = []
+    # one stray non-UTF-8 byte (binary paste, 8-bit terminal) must not throw
+    # away the whole query
+    try:
+        if hasattr(sys.stdin, "reconfigure"):
+            sys.stdin.reconfigure(errors="replace")
+    except (ValueError, OSError):
+        pass
+    _feed_muted.set()
     try:
         tty.setraw(fd)
         sys.stdout.write("\x1b[?25l")            # hide cursor
@@ -2519,17 +2864,19 @@ def live_search(rows, player_label="watch", multi=False):
             elif ch >= " ":
                 query += ch
                 sel = 0
-        sys.stdout.write("\r\x1b[J\x1b[?25h")    # clear + show cursor
-        sys.stdout.flush()
     except Exception:
-        sys.stdout.write("\r\x1b[J\x1b[?25h")
-        sys.stdout.flush()
         if os.environ.get("SMOLVAULT_DEBUG"):
             import traceback
             traceback.print_exc()
         return None
     finally:
+        # the cursor must come back on *every* exit path: it used to be
+        # restored only in the happy path and `except Exception`, so a
+        # KeyboardInterrupt left the shell prompt drawn cursor-less
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\r\x1b[J\x1b[?25h")    # clear + show cursor
+        sys.stdout.flush()
+        _feed_muted.clear()
 
     if dbg:
         print(f"DEBUG live_search exit q={query!r} sel={sel} n={len(matches)}", flush=True)
@@ -2549,6 +2896,15 @@ def multi_pick(rows):
 # ---------------------------------------------------------------------------
 # Browse navigator — a tiny file manager over the raw-mode toolkit
 # ---------------------------------------------------------------------------
+
+BROWSE_CMD = ":"
+"""Command prefix for the file-manager pickers.
+
+`a`/`u`/`s` used to be bound as bare action keys *ahead* of the printable
+branch, so those three letters could never reach the filter: typing `usa`
+wiped the selection, selected the whole visible subtree and sealed. Every
+letter is now typeable, and the actions live behind `:`."""
+
 
 def scan_dir(d, vault_suffixes=(".vault", ".vault-shm", ".vault-wal")):
     """[(name, is_dir, size)] dirs-first, natural-sorted. Hidden entries,
@@ -2604,15 +2960,19 @@ class BrowseState:
         return None if r.startswith("..") else r
 
     def entries(self):
-        """Filtered, ordered visible entries:
-        [(name, is_dir, size, abspath)]."""
+        """Filtered, ordered visible entries as 5-tuples
+        ``(name, is_dir, size, abspath, row)``.
+
+        The row is the backing listing record when the subclass has one
+        (the vault browser), else None — carrying it means the renderer
+        never has to look a file up again."""
         q = self.query.lower()
         out = []
         for name, is_dir, size in self._scan(self.cur):
             if q and q not in name.lower():
                 continue
             out.append((name, is_dir, size,
-                        os.path.join(self.cur, name)))
+                        os.path.join(self.cur, name), None))
         return out
 
     def current(self):
@@ -2659,7 +3019,7 @@ class BrowseState:
         e = self.current()
         if not e:
             return
-        _, is_dir, _, abspath = e
+        _, is_dir, _, abspath, _row = e
         if is_dir:
             self.toggle_subtree(abspath)
         else:
@@ -2674,7 +3034,7 @@ class BrowseState:
             self.checked |= files
 
     def select_visible(self):
-        for _, is_dir, _, abspath in self.entries():
+        for _, is_dir, _, abspath, _row in self.entries():
             if is_dir:
                 self.checked |= self._subtree_files(abspath)
             else:
@@ -2741,22 +3101,24 @@ class RemoteBrowseState(BrowseState):
         return out
 
 
-class VaultBrowseState:
-    """Navigator over vault-stored files (virtual FS derived from Store.list_dir).
+class VaultBrowseState(BrowseState):
+    """Navigator over vault-stored files (virtual FS derived from the
+    listing's paths).
 
-    *store* is a Store (local) or ListingStore (remote rows). Paths are vault-absolute
-    with leading '/'. Reuses BrowseState keymap but shows size/mime and supports
-    single-file pick for get/watch or multi for export.
+    *store* is a Store (local) or ListingStore (remote rows). Paths are
+    vault-absolute with leading '/'. A real BrowseState subclass, so the
+    keymap, subtree toggles and multi-select are the same ones `browse_picker`
+    uses; the only differences are that `_scan` is derived from the listing
+    rather than the filesystem, and that entries carry their row so the
+    renderer is O(1) per visible row instead of a linear rescan.
     """
 
     def __init__(self, store):
+        super().__init__("/", anchor="/")
         self.store = store
-        self.root = "/"
-        self.anchor = "/"
-        self.cur = "/"
-        self.query = ""
-        self.sel = 0
         self._rows_cache = None
+        self._scan_cache = None      # (cur, query) -> entries
+        self._cmd = False            # a BROWSE_CMD prefix is pending
 
     def _all_rows(self):
         if self._rows_cache is None:
@@ -2766,61 +3128,81 @@ class VaultBrowseState:
                 self._rows_cache = []
         return self._rows_cache
 
-    def _scan(self, d):
-        # derive entries from vault file paths (prefix tree)
-        prefix = d.rstrip("/") + "/" if d != "/" else "/"
-        dirs_set = set()
-        files = []
+    # ---- selection: files only (a vault dir is a path prefix, not a file) ----
+
+    def _subtree_files(self, abs_dir):
+        if abs_dir not in self._subtree_cache:
+            prefix = abs_dir.rstrip("/") + "/"
+            acc = set(p for p in (r["path"] for r in self._all_rows())
+                      if p.startswith(prefix))
+            self._subtree_cache[abs_dir] = frozenset(acc)
+        return self._subtree_cache[abs_dir]
+
+    def _rel_anchor(self, vault_path):
+        return None if vault_path == self.anchor else vault_path.lstrip("/")
+
+    def confirm_items(self):
+        """Selection → [(vault_path, relpath-to-anchor)], natural-sorted."""
+        anchor = self.anchor.rstrip("/")
+        out = []
+        for vp in sorted(self.checked, key=natural_key):
+            rel = vp[len(anchor):].lstrip("/") if vp.startswith(anchor) \
+                else os.path.basename(vp)
+            out.append((vp, rel))
+        return out
+
+    # ---- listing ---------------------------------------------------------------
+
+    def _build(self, d):
+        """Direct children of *d*, derived from the listing's path prefixes.
+
+        Returns 5-tuples (name, is_dir, size, abspath, row) — the row is
+        carried through so the renderer never has to search for it again.
+        """
+        prefix = "/" if d == "/" else d.rstrip("/") + "/"
+        dirs_set, files = set(), []
         for r in self._all_rows():
             p = r["path"]
-            if not p.startswith(prefix) and p != prefix.rstrip("/"):
-                if d != "/":
-                    continue
-                # for root, include top-level files like /a.txt (prefix "/")
-                if not p.startswith("/"):
-                    continue
-            if d == "/":
-                rest = p.lstrip("/")
-            else:
-                if not p.startswith(prefix):
-                    continue
-                rest = p[len(prefix):]
+            if not p.startswith(prefix):
+                continue
+            rest = p[len(prefix):]
             if not rest:
                 continue
             if "/" in rest:
                 dirs_set.add(rest.split("/", 1)[0])
             else:
                 files.append((rest, False, r["size"], p, r))
-        dirs = sorted([(n, True, 0, prefix.rstrip("/") + "/" + n if prefix != "/" else "/" + n, None) for n in dirs_set], key=lambda t: natural_key(t[0]))
-        files_sorted = sorted(files, key=lambda t: natural_key(t[0]))
-        # filter by query
+        dirs = sorted(((n, True, 0, prefix + n, None) for n in dirs_set),
+                      key=lambda t: natural_key(t[0]))
+        out = dirs + sorted(files, key=lambda t: natural_key(t[0]))
         q = self.query.lower()
-        out = []
-        for name, is_dir, size, abspath, row in dirs + files_sorted:
-            if q and q not in name.lower():
-                continue
-            out.append((name, is_dir, size, abspath))
+        if q:
+            out = [e for e in out if q in e[0].lower()]
+        return out
+
+    def _scan(self, d):
+        key = (d, self.query)
+        if self._scan_cache is not None and self._scan_cache[0] == key:
+            return self._scan_cache[1]
+        out = self._build(d)
+        self._scan_cache = (key, out)
         return out
 
     def entries(self):
-        # limit to current dir's direct children, already filtered
+        """_build already filters and returns the 5-tuple shape."""
         return self._scan(self.cur)
 
-    def current(self):
-        es = self.entries()
-        return es[self.sel] if 0 <= self.sel < len(es) else None
+    def _invalidate(self):
+        self._scan_cache = None
 
     def descend(self):
         e = self.current()
         if e and e[1]:
-            # enter dir
-            name = e[0]
-            if self.cur == "/":
-                self.cur = "/" + name
-            else:
-                self.cur = self.cur.rstrip("/") + "/" + name
+            self.cur = self.cur.rstrip("/") + "/" + e[0] \
+                if self.cur != "/" else "/" + e[0]
             self.query = ""
             self.sel = 0
+            self._invalidate()
 
     def parent(self):
         if self.cur != "/":
@@ -2829,6 +3211,13 @@ class VaultBrowseState:
                 self.cur = "/" + self.cur
             self.query = ""
             self.sel = 0
+            self._invalidate()
+
+    def set_query(self, q):
+        """Single funnel for filter edits so the memo is always invalidated."""
+        self.query = q
+        self.sel = 0
+        self._invalidate()
 
     def file_row(self, vault_path):
         for r in self._all_rows():
@@ -2837,27 +3226,34 @@ class VaultBrowseState:
         return None
 
 
-def vault_browse_picker(store, label="browse"):
-    """Vault file manager (tiny) for get/watch. Returns (vault_path, row) or None.
-    Uses VaultBrowseState with same raw protocol as browse_picker."""
+def vault_browse_picker(store, label="browse", multi=False, remote=None):
+    """Vault file manager (tiny) for get/watch/library/info/copy.
+
+    Returns (vault_path, row), or — with *multi* — a list of those for the
+    rows the user checked, or None. *remote*, when given, is the RemoteVault
+    a listing came from, so the `i` overlay renders remote metadata instead
+    of reaching for a manifest the listing does not carry.
+    """
     if not (sys.stdin.isatty() and sys.stdout.isatty() and _termios_available()):
         # fallback: live search
         rows = list(store.all_files())
         if not rows:
             print(yellow("  (library is empty)"))
             return None
-        picked = live_search(rows, player_label=label)
+        picked = live_search(rows, player_label=label, multi=multi)
         return picked
+
     import termios
     import tty
     st = VaultBrowseState(store)
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
+    _feed_muted.set()
     try:
         tty.setraw(fd)
         sys.stdout.write("\x1b[2J\x1b[H\x1b[?25l")
         while True:
-            sys.stdout.write(_vault_browse_render(st, label))
+            sys.stdout.write(_vault_browse_render(st, label, multi))
             sys.stdout.flush()
             key = _read_key(fd)
             if key is None or key in ("esc", "\x1b", "\x03", "\x04"):
@@ -2875,39 +3271,67 @@ def vault_browse_picker(store, label="browse"):
                 e = st.current()
                 if e and e[1]:
                     st.descend()
+                elif multi:
+                    st.toggle()
                 elif e:
-                    row = st.file_row(e[3])
+                    row = e[4] or st.file_row(e[3])
                     if row is not None:
                         return (e[3], row)
             elif key in ("i", "I"):
                 e = st.current()
                 if e and not e[1]:
-                    row = st.file_row(e[3])
+                    row = e[4] or st.file_row(e[3])
                     if row:
-                        # show info overlay briefly (leave raw, print then wait)
+                        # leave raw, print, wait, come back
                         sys.stdout.write("\r\x1b[J\x1b[?25h")
                         sys.stdout.flush()
                         termios.tcsetattr(fd, termios.TCSADRAIN, old)
-                        show_info(store, e[3])
-                        input(dim("  press Enter to return…"))
+                        try:
+                            # a listing row has no manifest, so show_info
+                            # (which needs one) can only serve a local Store
+                            if remote is not None or not hasattr(
+                                    store, "read_full"):
+                                remote_info(remote, e[3])
+                            else:
+                                show_info(store, e[3])
+                            input(dim("  press Enter to return…"))
+                        except (EOFError, KeyboardInterrupt):
+                            return None
                         tty.setraw(fd)
                         sys.stdout.write("\x1b[2J\x1b[H\x1b[?25l")
             elif key in ("\x7f", "\b"):
-                if st.query:
-                    st.query = st.query[:-1]
-                    st.sel = 0
+                if st._cmd:
+                    st._cmd = False
+                elif st.query:
+                    st.set_query(st.query[:-1])
                 else:
                     st.parent()
+            elif key == BROWSE_CMD:
+                st._cmd = True
+            elif st._cmd:
+                st._cmd = False
+                if key == "a":
+                    st.select_visible()
+                elif key == "u":
+                    st.clear()
+                elif key == "s":
+                    picked = st.confirm_items()
+                    return ([(vp, st.file_row(vp)) for vp, _ in picked]
+                            if multi else None)
+                elif key == "i":
+                    pass
+            elif multi and key == " ":
+                st.toggle()
             elif len(key) == 1 and key >= " ":
-                st.query += key
-                st.sel = 0
+                st.set_query(st.query + key)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         sys.stdout.write("\r\x1b[J\x1b[?25h")
         sys.stdout.flush()
+        _feed_muted.clear()
 
 
-def _vault_browse_render(st, label="browse"):
+def _vault_browse_render(st, label="browse", multi=False):
     """Vault browser frame, raw-protocol."""
     def line(s=""):
         return "\r" + s + "\x1b[K"
@@ -2917,6 +3341,8 @@ def _vault_browse_render(st, label="browse"):
     es = st.entries()
     st.sel = min(st.sel, max(len(es) - 1, 0))
     counts = dim(f"   {len(es)} shown")
+    if multi and st.checked:
+        counts = green(f"   ✓{len(st.checked)}") + counts
     if not st._all_rows():
         counts += yellow(" · empty")
     B = "─" * 66
@@ -2928,20 +3354,33 @@ def _vault_browse_render(st, label="browse"):
         if entry is None:
             lines.append(line())
             continue
-        name, is_dir, size, abspath = entry
+        name, is_dir, size, abspath, row = entry
         cursor = " ❯ " if i == st.sel else "   "
         if is_dir:
             mark = dim("   dir")
+            if multi:
+                mk = st.dir_marker(abspath)
+                mark = dim("   dir") if not mk else (
+                    green(f"✓ {mk[0]}/{mk[1]}") if mk[0] == mk[1]
+                    else (yellow(f"◐ {mk[0]}/{mk[1]}") if mk[0]
+                          else dim(f"○ {mk[1]}")))
             name_col = cyan(name + "/")
         else:
-            # file: show size and mime hint
-            row = st.file_row(abspath)
+            # the row rides along in the entry: a file_row() lookup here
+            # was a linear scan of the whole library per visible row
             mime = (row["mime"] or "?").split("/")[-1][:10] if row else "?"
             mark = dim(f"{fmt(size).rjust(10)} {mime}")
-            name_col = name
+            tick = green("✓") if abspath in st.checked else " "
+            name_col = (tick + " " + name) if multi else name
         lines.append(line(f" {cursor} {name_col:<40}{mark}"))
     lines.append(line(dim("  " + B)))
-    foot = "  ↑↓ move · → open · ← up · Enter pick · i info · esc"
+    if multi:
+        foot = "  ↑↓ move · → open · ← up · space ✓ · i info · esc"
+        foot += dim(f" · {BROWSE_CMD}a all · {BROWSE_CMD}u none"
+                    f" · {BROWSE_CMD}s seal"
+                    + (f" ✓{len(st.checked)}" if st.checked else ""))
+    else:
+        foot = "  ↑↓ move · → open · ← up · Enter pick · i info · esc"
     if st.query:
         foot += dim(" · backspace filter")
     foot += dim(" · type to filter")
@@ -2959,8 +3398,10 @@ def remote_browse_picker(rv):
     import termios
     import tty
     st = RemoteBrowseState(rv)
+    st._cmd = False
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
+    _feed_muted.set()
     try:
         tty.setraw(fd)
         sys.stdout.write("\x1b[2J\x1b[H\x1b[?25l")
@@ -2993,12 +3434,16 @@ def remote_browse_picker(rv):
                     st.sel = 0
                 else:
                     st.parent()
-            elif key == "a":
-                st.select_visible()
-            elif key == "u":
-                st.clear()
-            elif key == "s":
-                return st.confirm_items()
+            elif key == BROWSE_CMD:
+                st._cmd = True
+            elif st._cmd:
+                st._cmd = False
+                if key == "a":
+                    st.select_visible()
+                elif key == "u":
+                    st.clear()
+                elif key == "s":
+                    return st.confirm_items()
             elif len(key) == 1 and key >= " ":
                 st.query += key
                 st.sel = 0
@@ -3006,6 +3451,7 @@ def remote_browse_picker(rv):
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         sys.stdout.write("\r\x1b[J\x1b[?25h")
         sys.stdout.flush()
+        _feed_muted.clear()
 
 
 def _parse_escape(seq):
@@ -3035,11 +3481,24 @@ def _read_key(fd):
     """Read one logical key in raw mode: printable char, action token
     (up/down/right/left/esc/ignore) or None on EOF. Escape sequences are
     drained atomically, so split deliveries and application-mode
-    (\x1bO..) or modified (\x1b[1;5..) forms all parse cleanly."""
+    (\\x1bO..) or modified (\\x1b[1;5..) forms all parse cleanly.
+
+    A UTF-8 lead byte is completed with its continuation bytes before
+    decoding: reading one byte at a time turned every non-ASCII character
+    into U+FFFD, so a filter could never match `café.mkv` and the board
+    permanently stored corrupted text."""
     import select as _sel
     b = os.read(fd, 1)
     if not b:
         return None
+    if 0xC2 <= b[0] <= 0xF4:                 # possible UTF-8 lead byte
+        need = {0x2: 1, 0x3: 2, 0x4: 3}.get(b[0] >> 5, 3)
+        while need:
+            more = os.read(fd, need)
+            if not more:
+                break
+            b += more
+            need -= len(more)
     c = b.decode("utf-8", "replace")
     if c != "\x1b":
         return c
@@ -3076,7 +3535,7 @@ def _browse_render(st):
     es = st.entries()
     st.sel = min(st.sel, max(len(es) - 1, 0))
     partial = full = 0
-    for name, is_dir, size, r in es:
+    for name, is_dir, size, r, _row in es:
         if is_dir:
             mk = st.dir_marker(r)
             if mk:
@@ -3103,7 +3562,7 @@ def _browse_render(st):
         if entry is None:
             lines.append(line())
             continue
-        name, is_dir, size, r = entry
+        name, is_dir, size, r, _row = entry
         cursor = " ❯ " if i == st.sel else "   "
         tick = green("✓") if r in st.checked else " "
         if is_dir:
@@ -3121,9 +3580,10 @@ def _browse_render(st):
             name_col = tick + " " + name
         lines.append(line(f" {cursor} {name_col:<40}{mark}"))
     lines.append(line(dim("  " + B)))
-    foot = "  ↑↓ move · → open · ← up · space ✓ · a all · u none"
-    foot += dim(" · s seal " + (f"✓{len(st.checked)}" if st.checked
-                                else "") + " · esc")
+    foot = "  ↑↓ move · → open · ← up · space ✓ · "
+    foot += (f"{BROWSE_CMD}a all · {BROWSE_CMD}u none"
+             + dim(f" · {BROWSE_CMD}s seal"
+                   + (f" ✓{len(st.checked)}" if st.checked else "") + " · esc"))
     lines.append(line(foot))
     return "\n".join(lines) + f"\r\x1b[{len(lines)}A"
 
@@ -3152,8 +3612,10 @@ def browse_picker(start=None):
     import termios
     import tty
     st = BrowseState(start, anchor=start)          # locked to start dir
+    st._cmd = False
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
+    _feed_muted.set()
     try:
         tty.setraw(fd)
         sys.stdout.write("\x1b[2J\x1b[H\x1b[?25l")   # clear slate, own screen
@@ -3186,12 +3648,16 @@ def browse_picker(start=None):
                     st.sel = 0
                 else:
                     st.parent()
-            elif key == "a":
-                st.select_visible()
-            elif key == "u":
-                st.clear()
-            elif key == "s":
-                return st.confirm_items()
+            elif key == BROWSE_CMD:
+                st._cmd = True
+            elif st._cmd:
+                st._cmd = False
+                if key == "a":
+                    st.select_visible()
+                elif key == "u":
+                    st.clear()
+                elif key == "s":
+                    return st.confirm_items()
             elif len(key) == 1 and key >= " ":
                 st.query += key
                 st.sel = 0
@@ -3201,6 +3667,7 @@ def browse_picker(start=None):
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
         sys.stdout.write("\r\x1b[J\x1b[?25h")
         sys.stdout.flush()
+        _feed_muted.clear()
 
 
 def _termios_available():
@@ -3230,8 +3697,11 @@ def _live_search_fallback(rows, player_label="watch", multi=False):
             if chosen:
                 return chosen
             continue
-        raw = input(cyan(f"  take [Enter]=all {len(matches)} · "
-                         f"<n>=one · q=cancel: ")).strip().lower()
+        try:
+            raw = input(cyan(f"  take [Enter]=all {len(matches)} · "
+                             f"<n>=one · q=cancel: ")).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return None
         if raw == "q":
             return None
         if raw.isdigit() and 1 <= int(raw) <= min(len(matches), 12):
@@ -3239,13 +3709,16 @@ def _live_search_fallback(rows, player_label="watch", multi=False):
         return matches
 
 
-def _board_render(view, buffer_text, anchor_label):
+def _board_render(view, buffer_text, anchor_label, error=None):
     """Board frame: live_search protocol (\r-led, \x1b[K, cursor-up)."""
     def line(s=""):
         return "\r" + s + "\x1b[K"
-    lines = ["\x1b[J" + line(f"  board ❯ {anchor_label}"
-                              + dim(f"   {len(view)} messages"
-                                    + " · live"))]
+    badge = dim(f"   {len(view)} messages · live")
+    if error:
+        # a peer that goes away used to freeze the board silently, behind a
+        # "live" badge, with no way to tell it from "no new messages"
+        badge = red("   ⚠ offline — retrying")
+    lines = ["\x1b[J" + line(f"  board ❯ {anchor_label}" + badge)]
     for r in view[-18:]:
         ts = str(r.get("ts", ""))[5:16]
         if r.get("kind") == "system":
@@ -3255,7 +3728,7 @@ def _board_render(view, buffer_text, anchor_label):
                               + dim(f"[{ts}]  ") + r["body"]))
     lines.append(line(""))
     lines.append(line(f"  {cyan('post ❯')} {buffer_text}█   "
-                      + dim("(enter=send · esc=back)")))
+                      + dim("(enter=send · esc/q=back)")))
     return "\n".join(lines) + f"\r\x1b[{len(lines)}A"
 
 
@@ -3304,8 +3777,12 @@ def board_live(store=None, fetch=None, send=None, read_key=None,
     fd = None
     old = None
     if interactive:
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
+        try:
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+        except (termios.error, ValueError, OSError):
+            # assume_tty can claim a terminal we don't have
+            return board_prompt(store=store, fetch=fetch, send=send)
         tty.setraw(fd)
 
         def read_key():                       # default: real keyboard
@@ -3315,17 +3792,20 @@ def board_live(store=None, fetch=None, send=None, read_key=None,
             k = _read_key(fd)
             return k if k is not None else "esc"   # stdin EOF → exit
     last_poll = 0.0
+    board_err = None
 
     def drain_and_render():
-        nonlocal last
+        nonlocal last, board_err
         try:
             fresh = load(last)
-            for m in fresh:
-                view.append(m)
-                last = m["id"]
-        except Exception:
-            pass
-        sys.stdout.write(_board_render(view[-20:], buf, label))
+            board_err = None                # recovered
+        except Exception as e:
+            board_err = str(e)
+            fresh = []
+        for m in fresh:
+            view.append(m)
+            last = m["id"]
+        sys.stdout.write(_board_render(view[-20:], buf, label, board_err))
         sys.stdout.flush()
 
     _feed_muted.set()
@@ -3344,6 +3824,10 @@ def board_live(store=None, fetch=None, send=None, read_key=None,
                 r, _, _ = select.select([fd], [], [], 0.2)
                 if not r:
                     continue
+            else:
+                # an injected read_key has no select() to throttle it, so
+                # an always-"tick" reader used to spin a core flat out
+                time.sleep(0.05)
             key = read_key()
             if key == "tick":
                 continue
@@ -3353,16 +3837,14 @@ def board_live(store=None, fetch=None, send=None, read_key=None,
                 if buf.strip():
                     try:
                         if post(buf.strip()):
-                            drain_and_render()
-                        buf = ""
+                            buf = ""
                     except ValueError as e:
                         print("\r" + red(f"  ✗ {e}"))
                         buf = ""
-                else:
-                    drain_and_render()
-                if interactive:
-                    drain_and_render()
+                drain_and_render()
                 continue
+            if key == "q":                    # documented exit, not a post
+                break
             if key == "\x7f":
                 buf = buf[:-1]
             elif len(key) == 1 and key >= " ":
@@ -3567,7 +4049,14 @@ def export_file(store, arg, out=None):
 
 def print_banner(vault, s, urls, auth_on, server_state="● running",
                  enc_on=False, auth_required=None):
-    state_col = green(server_state) if "running" in server_state else yellow(server_state)
+    # match on the glyph, not the substring: the client passes "● connected",
+    # which never contained "running" and so painted itself yellow
+    if server_state.strip().startswith("●"):
+        state_col = green(server_state)
+    elif server_state.strip().startswith("○"):
+        state_col = yellow(server_state)
+    else:
+        state_col = cyan(server_state)
     if auth_on:
         auth = ("LAN streaming open" if auth_required is False
                 else "password protected")
@@ -3652,11 +4141,13 @@ def bootstrap_vault(explicit=None):
 
 
 class Wizard:
-    def __init__(self, store, vault, no_discover=False, player=None):
+    def __init__(self, store, vault, no_discover=False, player=None,
+                 port=None):
         self.store = store
         self.vault = vault
         self.no_discover = no_discover
         self.player = player
+        self.port_arg = port           # --port, honoured by the port picker
         self.discovery = None
         self.srv = None
         self.port = None
@@ -3750,8 +4241,6 @@ class Wizard:
             print(dim("  (p watch · l list)"))
 
     def do_play(self):
-        if os.environ.get("SMOLVAULT_DEBUG"):
-            print("DEBUG do_play enter", flush=True)
         explicit_player = os.environ.get("SMOLVAULT_PLAYER") or self.player \
             or None
         if explicit_player and shutil.which(explicit_player) is None:
@@ -3768,44 +4257,11 @@ class Wizard:
             return
         if mode in ("b", "browse"):
             picked = vault_browse_picker(self.store, label="watch")
-            if not picked:
-                return
-            path, row = picked
-            chosen = picked
         else:
-            chosen = live_search(rows)
-            if not chosen:
-                return
-            path, row = chosen
-        mime = row["mime"] or ""
-        if not mime.startswith(("video/", "audio/", "image/")):
-            print(yellow(f"  '{path}' is {mime} — not watchable. Use [g]."))
+            picked = live_search(rows)
+        if not picked:
             return
-
-        base = f"http://127.0.0.1:{self.port}" if self.srv else None
-        ephemeral = None
-        if not base:
-            # sharing stopped — spin a private loopback server for this
-            # session instead of dead-ending on "press S first"
-            ephemeral = make_server(self.store, "127.0.0.1", 0)
-            port = ephemeral.server_address[1]
-            threading.Thread(target=ephemeral.serve_forever, daemon=True).start()
-            base = f"http://127.0.0.1:{port}"
-            print(dim(f"  · private loopback :{port}"))
-
-        def spawn(p):
-            url = base + urllib.parse.quote(p)
-            if self.store.auth_required() and self.pw:
-                url = cred_url(url, self.pw)
-            return play_url(url, mime, explicit_player)
-
-        try:
-            all_paths = [r["path"] for r in rows]
-            watch_flow(spawn, path, all_paths, explicit_player or "mpv")
-        finally:
-            if ephemeral:
-                ephemeral.shutdown()
-                ephemeral.server_close()
+        self._play_path(picked[0], picked[1])
 
     def do_search(self):
         q = self.ask("  search: ")
@@ -3820,7 +4276,47 @@ class Wizard:
         if ans.isdigit():
             idx = int(ans) - 1
             if 0 <= idx < min(len(matches), 12):
-                play_query(self.store, matches[idx][0].rsplit("/", 1)[-1])
+                # play the row that was just shown: re-searching by basename
+                # could hand the player a *different* file with that name
+                _path, _row = matches[idx]
+                self._play_path(_path, _row)
+
+    def _play_path(self, path, row):
+        """Spin the player (and the binge prompt) for one already-picked row."""
+        mime = row["mime"] or ""
+        if not mime.startswith(("video/", "audio/", "image/")):
+            print(yellow(f"  '{path}' is {mime} — not watchable. Use [g]."))
+            return
+        base = f"http://127.0.0.1:{self.port}" if self.srv else None
+        ephemeral = None
+        if not base:
+            # sharing stopped — spin a private loopback server for this
+            # session instead of dead-ending on "press S first"
+            ephemeral = make_server(self.store, "127.0.0.1", 0)
+            port = ephemeral.server_address[1]
+            threading.Thread(target=ephemeral.serve_forever,
+                             daemon=True).start()
+            base = f"http://127.0.0.1:{port}"
+            print(dim(f"  · private loopback :{port}"))
+        explicit_player = os.environ.get("SMOLVAULT_PLAYER") or self.player \
+            or None
+
+        def spawn(p):
+            url = base + urllib.parse.quote(p)
+            if self.store.auth_required() and self.pw:
+                url = cred_url(url, self.pw)
+            return play_url(url, mime, explicit_player)
+
+        _feed_muted.set()
+        try:
+            watch_flow(spawn, path, [r["path"] for r in
+                                     self.store.all_files()],
+                       explicit_player or "mpv")
+        finally:
+            _feed_muted.clear()
+            if ephemeral:
+                ephemeral.shutdown()
+                ephemeral.server_close()
 
     def do_info(self):
         q = self.ask("  file (path or search term): ")
@@ -3828,15 +4324,19 @@ class Wizard:
             show_info(self.store, q)
 
     def do_get(self):
-        # tiny file manager for get — [b]rowse vault
+        # tiny file manager for get — [b]rowse vault (multi: export many)
         q = self.ask("  export [b]rowse vault or type path/term: ").strip()
         if not q:
             return
         if q.lower() in ("b", "browse"):
-            picked = vault_browse_picker(self.store, label="get")
+            picked = vault_browse_picker(self.store, label="get", multi=True)
             if not picked:
                 return
-            q = picked[0]
+            out = self.ask(dim("  save as? [default: same name]") + " ").strip()
+            for path, _row in picked:
+                export_file(self.store, path,
+                            out or os.path.basename(path))
+            return
         out = self.ask(dim("  save as? [default: same name]") + " ").strip()
         export_file(self.store, q, out or None)
 
@@ -3955,11 +4455,22 @@ class Wizard:
                                 print(yellow("  ○ LAN streaming stays open "
                                              "(files still encrypted)"))
         except EOFError:
+            # getpass falls back to readline() off a TTY and raises here.
+            # Swallowing this used to fall straight through to
+            # start_server(), publishing a still-locked vault on 0.0.0.0
+            # with self.pw unset.
             print()
+            if self.store.enc_enabled() and not self.store.is_unlocked():
+                print(red("  ✗ vault is locked — cannot continue "
+                          "(password required to unlock)"))
+                return EXIT_NOMATCH
 
         # new vault or legacy vault without port: pick port (Enter=auto)
         if self.store.cfg_get("lan_port") is None:
-            prompt_for_port(self.store)
+            # honour --port here too: main() only passes it for a *new*
+            # vault, so `smolvault.py lib.vault -i --port 9000` used to
+            # prompt and store something else entirely
+            prompt_for_port(self.store, explicit=self.port_arg)
 
         if not self.start_server():
             print(yellow("  continuing without network sharing"))
@@ -3989,6 +4500,11 @@ class Wizard:
                     self.dispatch(key)
                 except KeyboardInterrupt:
                     self._interrupt()
+                except EOFError:
+                    # Ctrl+D at a nested prompt (a picker's "press Enter",
+                    # the folder question, …) is a clean exit, not a
+                    # traceback that escapes the wizard
+                    raise QuitWizard()
         except QuitWizard:
             print(dim("\n  bye 👋"))
             return EXIT_OK
@@ -4065,10 +4581,10 @@ class Wizard:
                 except QuitWizard:
                     return
                 if ans in ("b", "browse"):
-                    picked = vault_browse_picker(self.store, label="library")
-                    if picked:
-                        # show info for picked file as preview
-                        show_info(self.store, picked[0])
+                    picked = vault_browse_picker(
+                        self.store, label="library", multi=True)
+                    for path, _row in (picked or []):
+                        show_info(self.store, path)
                     return
             return list_library(self.store)
         def _do_info():
@@ -4093,8 +4609,6 @@ class Wizard:
             "P": self.do_port,
             "v": lambda: self._verify(),
         }
-        if key in ("", "h", "help", "?"):
-            return
         fn = actions.get(key)                  # case matters: 'S' = server
         if fn:
             fn()
@@ -4128,6 +4642,10 @@ class RemoteVault:
         self.host, self.port = host, int(port)
         self.password = None
         self.rows = None
+        # None = not probed yet. Never left undefined: cred_url consults it,
+        # and a stale value survived `r` (reconnect), which embedded one
+        # vault's password into URLs aimed at a different vault.
+        self._auth_probe = None
 
     @property
     def base(self):
@@ -4152,34 +4670,54 @@ class RemoteVault:
         except OSError as e:
             raise RemoteError(
                 _friendly_oserror(e, self.host, self.port)) from e
+        except http.client.HTTPException as e:
+            # IncompleteRead / BadStatusLine / ResponseNotReady are
+            # HTTPException, not OSError: a transfer that dies mid-stream
+            # used to escape uncaught as a raw traceback
+            raise RemoteError(f"transfer failed on {path}: {e}") from e
         finally:
             conn.close()
 
     def _fetch_inner(self, conn, path, out, method, body,
                      headers, progress):
-            conn.request(method, path, body=body,
-                         headers={**self._headers(), **(headers or {})})
-            r = conn.getresponse()
-            if r.status in (401, 403) and self.password is None:
-                raise AuthRequired()
-            if r.status != 200:
-                raise RemoteError(f"HTTP {r.status} on {path}")
-            if out is None:
-                return json.loads(r.read())
-            total = int(r.getheader("Content-Length") or 0)
-            bar = ProgressBar(os.path.basename(out), total or 1)
+        conn.request(method, path, body=body,
+                     headers={**self._headers(), **(headers or {})})
+        r = conn.getresponse()
+        if r.status in (401, 403) and self.password is None:
+            raise AuthRequired()
+        if r.status != 200:
+            raise RemoteError(f"HTTP {r.status} on {path}")
+        if out is None:
+            return json.loads(r.read())
+        total = int(r.getheader("Content-Length") or 0)
+        bar = ProgressBar(os.path.basename(out), total or 1)
+        written = 0
+        try:
             with open(out, "wb") as f:
                 while True:
                     chunk = r.read(256 * 1024)
                     if not chunk:
                         break
                     f.write(chunk)
+                    written += len(chunk)
                     if progress:
                         progress(len(chunk), bar)
                     else:
                         bar.update(len(chunk))
-            bar.finish()
-            return True
+            if total and written != total:
+                raise RemoteError(
+                    f"short read on {path}: wanted {fmt(total)}, "
+                    f"got {fmt(written)}")
+        except BaseException:
+            # never leave a truncated file where the next attempt will
+            # refuse to overwrite it
+            try:
+                os.unlink(out)
+            except OSError:
+                pass
+            raise
+        bar.finish()
+        return True
 
     def authenticate(self):
         """Fetch listing; prompt for password once if the vault has auth."""
@@ -4206,10 +4744,12 @@ class RemoteVault:
     def cred_url(self, path):
         url = self.url_for(path)
         if self.password and self.store_requires_auth():
-            url = url.replace("//", "//smolvault:"
-                              + urllib.parse.quote(self.password,
-                                                   safe="") + "@", 1)
+            url = cred_url(url, self.password)
         return url
+
+    def reset_auth_probe(self):
+        """Forget the cached auth gate — call when the host changes."""
+        self._auth_probe = None
 
     def share_root_available(self):
         """Authed probe: does the remote vault expose --share-root?"""
@@ -4221,8 +4761,8 @@ class RemoteVault:
 
     def store_requires_auth(self):
         """Probe the vault once without credentials: 401 ⇒ gated.
-        Cached for the connection's lifetime."""
-        if getattr(self, "_auth_probe", None) is not None:
+        Cached for the connection's lifetime (see reset_auth_probe)."""
+        if self._auth_probe is not None:
             return self._auth_probe
         import http.client as hc
         try:
@@ -4239,11 +4779,12 @@ class RemoteVault:
         if os.path.exists(out):
             print(red(f"  ✗ refusing to overwrite local file: {out}"))
             return EXIT_NOMATCH
-        row = next((r for r in self.rows if r["path"] == path), None)
+        row = next((r for r in (self.rows or []) if r["path"] == path), None)
         expected = row["size"] if row else None
         try:
             self._fetch(urllib.parse.quote(path), out=out)
         except RemoteError as e:
+            # _fetch already unlinked any partial it created
             print(red(f"  ✗ export failed: {e}"))
             return EXIT_NOMATCH
         got = os.path.getsize(out)
@@ -4317,6 +4858,40 @@ def store_note_remote(rv, text):
         conn.getresponse().read(); conn.close()
     except Exception:
         pass
+
+
+def reset_auth_probe(rv):
+    """Module-level shim so callers need not know the attribute name."""
+    rv.reset_auth_probe()
+
+
+def run_client_ingest(rv, paths, into="/"):
+    """POST /__api/ingest and return the parsed body.
+
+    The status is checked: a 400 with {"error": ...} used to be parsed into
+    an empty result list, so the client printed *nothing* and the user
+    believed a whole tree had been sealed."""
+    conn = http.client.HTTPConnection(rv.host, rv.port, timeout=1800)
+    try:
+        conn.request(
+            "POST", "/__api/ingest",
+            body=json.dumps({"paths": list(paths), "into": into}),
+            headers={**rv._headers(), "Content-Type": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read()
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        if resp.status != 200 or "results" not in body:
+            detail = body.get("error") or raw[:80].decode(
+                "utf-8", "replace") or "bad response"
+            body = {"error": f"HTTP {resp.status}: {detail}"}
+        return body
+    finally:
+        conn.close()
 
 
 def _ensure_rows(rv):
@@ -4401,7 +4976,11 @@ def resolve_target(spec):
                     f"auth {'yes' if info['auth'] else 'no'}") \
             if info.get("files") is not None else ""
         print(f"    [{i}] {info.get('name', '?')} @ {cyan(host + ':' + str(port))}{extra}")
-    raw = input(cyan("  connect to which? [1]: ")).strip() or "1"
+    try:
+        raw = input(cyan("  connect to which? [1]: ")).strip() or "1"
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return []
     if not raw.isdigit() or not 1 <= int(raw) <= len(hits):
         print(red("  invalid choice"))
         return []
@@ -4445,6 +5024,15 @@ class _RespReader:
 def sync_vault(store, direction, host, port, assume_yes=False):
     """Mirror *direction* ('to'/'from') between this vault and a peer.
     Additive-only: fills gaps, skips sealed paths, deletes nothing."""
+    # normalize + validate *before* any network I/O: an unrecognised value
+    # used to fall through to the pull branch after already paying for a
+    # listing fetch and possibly a getpass prompt
+    direction = {"push": "to", "pull": "from"}.get(direction, direction)
+    if direction not in ("to", "from"):
+        print(red(f"  ✗ unknown sync direction {direction!r} "
+                  f"(want 'to' or 'from')"))
+        return EXIT_USAGE
+
     rv = RemoteVault(host, port)
     try:
         if not rv.authenticate():
@@ -4452,12 +5040,6 @@ def sync_vault(store, direction, host, port, assume_yes=False):
     except RemoteError as e:
         print(red(f"  ✗ {e}"))
         return EXIT_NOMATCH
-
-    # normalize aliases
-    if direction == "pull":
-        direction = "from"
-    if direction == "push":
-        direction = "to"
 
     mine = {r["path"]: r for r in store.all_files()}
     theirs = {r["path"]: r for r in rv.rows}
@@ -4505,6 +5087,7 @@ def sync_vault(store, direction, host, port, assume_yes=False):
                                  headers=rv._headers())
                     resp = conn.getresponse()
                     if resp.status != 200:
+                        bar.finish()      # else the bar is left dangling
                         print(red(f"  ✗ GET {path}: HTTP {resp.status}"))
                         failed += 1
                         continue
@@ -4514,6 +5097,7 @@ def sync_vault(store, direction, host, port, assume_yes=False):
                     if cl_header is not None:
                         try:
                             if int(cl_header) != expected:
+                                bar.finish()
                                 print(red(f"  ✗ GET {path}: size mismatch header {cl_header} vs expected {expected}"))
                                 failed += 1
                                 continue
@@ -4523,12 +5107,11 @@ def sync_vault(store, direction, host, port, assume_yes=False):
                     # C6: verify root_hash and size
                     theirs_row = theirs[path]
                     if res.size != expected or res.root_hash != theirs_row["root_hash"]:
+                        # drop_file, not a bare DELETE: the partial ingest
+                        # already committed every chunk, and orphaning them
+                        # bloated the vault with no in-band way to reclaim
+                        store.drop_file(path)
                         print(red(f"  ✗ {path}: hash/size mismatch after sync (got {res.root_hash[:8]} vs {theirs_row['root_hash'][:8]})"))
-                        try:
-                            store.conn().execute("DELETE FROM files WHERE path=?", (path,))
-                            store.conn().commit()
-                        except Exception:
-                            pass
                         failed += 1
                         continue
                 finally:
@@ -4543,10 +5126,12 @@ def sync_vault(store, direction, host, port, assume_yes=False):
 
                 st_code = rv.put_stream(path, gen(), sizes[path])
                 if st_code == 409:
+                    bar.finish()
                     skipped += 1
                     print(yellow(f"  = already sealed there: {path}"))
                     continue
                 if st_code != 201:
+                    bar.finish()
                     print(red(f"  ✗ PUT {path}: HTTP {st_code}"))
                     failed += 1
                     continue
@@ -4626,9 +5211,11 @@ def run_client(spec, player=None):
                         lb = "p"
                     if lb in ("b", "browse"):
                         rows = _ensure_rows(rv)
-                        picked = vault_browse_picker(ListingStore(rows), label="library")
-                        if picked:
-                            remote_info(rv, picked[0])
+                        picked = vault_browse_picker(
+                            ListingStore(rows), label="library",
+                            multi=True, remote=rv)
+                        for vp, _row in (picked or []):
+                            remote_info(rv, vp)
                         continue
                     rows = rv.rows = rv._fetch("/__api/list")
                     logical = sum(r["size"] for r in rows)
@@ -4656,7 +5243,8 @@ def run_client(spec, player=None):
                     except (EOFError, KeyboardInterrupt):
                         continue
                     if mode in ("b", "browse"):
-                        picked = vault_browse_picker(ListingStore(rows), label="watch")
+                        picked = vault_browse_picker(
+                            ListingStore(rows), label="watch", remote=rv)
                         if not picked:
                             continue
                         path, rrow = picked
@@ -4686,20 +5274,31 @@ def run_client(spec, player=None):
                     q = input("  file [b]rowse vault or type path/term: ").strip()
                     if q.lower() in ("b", "browse"):
                         rows = _ensure_rows(rv)
-                        picked = vault_browse_picker(ListingStore(rows), label="info")
+                        picked = vault_browse_picker(
+                            ListingStore(rows), label="info", remote=rv)
                         if not picked:
                             continue
                         q = picked[0]
                     if q:
+                        # the typed-path branch used to skip _ensure_rows,
+                        # so after any upload (which sets rv.rows = None)
+                        # this reported "no match" for a file that exists
+                        _ensure_rows(rv)
                         remote_info(rv, q)
                 elif key == "g":
                     q = input("  export [b]rowse vault or type path/term: ").strip()
                     if q.lower() in ("b", "browse"):
                         rows = _ensure_rows(rv)
-                        picked = vault_browse_picker(ListingStore(rows), label="get")
+                        picked = vault_browse_picker(
+                            ListingStore(rows), label="get",
+                            multi=True, remote=rv)
                         if not picked:
                             continue
-                        q = picked[0]
+                        out = input(dim("  save as? [default: same name]")
+                                    + " ").strip() or None
+                        for vp, _row in picked:
+                            rv.export(vp, out)
+                        continue
                     if not q:
                         continue
                     out = input(dim("  save as? [default: same name]")
@@ -4745,21 +5344,12 @@ def run_client(spec, player=None):
                             continue
                         into = input(dim("  into folder? [/]") + " ") \
                             .strip() or "/"
-                        conn = http.client.HTTPConnection(
-                            rv.host, rv.port, timeout=1800)
-                        try:
-                            conn.request(
-                                "POST", "/__api/ingest",
-                                body=json.dumps(
-                                    {"paths": [p for p, _ in picked],
-                                     "into": into}),
-                                headers={**rv._headers(),
-                                         "Content-Type":
-                                             "application/json"})
-                            resp = conn.getresponse()
-                            results = json.loads(resp.read())
-                        finally:
-                            conn.close()
+                        results = run_client_ingest(
+                            rv, [p for p, _ in picked], into)
+                        if "error" in results:
+                            print(red(f"  ✗ ingest rejected: "
+                                      f"{results['error']}"))
+                            continue
                         sealed = failed = 0
                         for rr_ in results.get("results", []):
                             if rr_["status"] == 201:
@@ -4775,7 +5365,11 @@ def run_client(spec, player=None):
                                           f"HTTP {rr_['status']}"))
                         rv.rows = None
                         if sealed:
-                            store_note_remote(rv, sealed, into)
+                            # 3 args into a 2-arg function: a TypeError here
+                            # ended the client with exit 1 *after* the
+                            # work had already landed
+                            store_note_remote(
+                                rv, f"sealed {sealed} file(s) into {into}")
                         if failed:
                             print(red(f"  ── {failed} failed"))
                         continue
@@ -4832,6 +5426,10 @@ def run_client(spec, player=None):
                         if rv2.authenticate():
                             rv.host, rv.port, rv.password = nh, np_, rv2.password
                             rv.rows = rv2.rows
+                            # the cached gate belongs to the old host; keep
+                            # it and cred_url would embed this vault's
+                            # password into URLs for a vault that needs none
+                            reset_auth_probe(rv)
                             print(green(f"  ● now connected to {nh}:{np_}"))
                         else:
                             print(red("  ✗ could not authenticate to target"))
@@ -4844,6 +5442,12 @@ def run_client(spec, player=None):
                     break
                 last_interrupt = now
                 print(yellow("  cancelled (Ctrl+C again to quit)"))
+            except (EOFError, KeyboardInterrupt):
+                # Ctrl+D at any nested prompt ("search:", "into folder?",
+                # the picker asker, …) used to escape run_client as a raw
+                # traceback and exit 1
+                print()
+                return EXIT_OK
             except RemoteError as e:
                 print(red(f"  ✗ {e}"))
     except QuitWizard:
@@ -4927,6 +5531,38 @@ def build_parser():
     return ap
 
 
+def _unlock_for_maintenance(store, password, vault):
+    """Unlock an encrypted vault for --check/--gc, or say why we can't.
+
+    Returns True when the vault is usable (including when it was never
+    encrypted). Prompts only when there's a terminal to prompt on."""
+    if not store.enc_enabled() or store.is_unlocked():
+        return True
+    wrong = False
+    for _ in range(3):
+        pw = password
+        if not pw:
+            if not sys.stdin.isatty():
+                print(red("incorrect password" if wrong else
+                          "vault is encrypted — provide -p/--password"))
+                return False
+            try:
+                pw = getpass.getpass(dim("  vault password: ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return False
+        if not pw:
+            return False
+        try:
+            store.unlock(pw)
+            return True
+        except ValueError:
+            wrong = True                # don't loop on one bad -p
+            password = None
+            print(red("  ✗ incorrect password"))
+    return False
+
+
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
@@ -4941,6 +5577,10 @@ def main(argv=None):
         if not args.vault:
             ap.error("vault required for --check/--gc")
         store = Store(args.vault)
+        # an encrypted vault needs unlocking before either can run; without
+        # this, --check died with a raw LockedVault traceback
+        if not _unlock_for_maintenance(store, args.password, args.vault):
+            return EXIT_NOMATCH
         if args.check:
             return EXIT_OK if store.check() else EXIT_NOMATCH
         store.gc()
@@ -5134,8 +5774,9 @@ def main(argv=None):
     # ---- wizard vs plain serve -------------------------------------------
     if interactive_wizard:
         return Wizard(store, vault,
-                          no_discover=args.no_discover,
-                          player=args.player).run()
+                      no_discover=args.no_discover,
+                      player=args.player,
+                      port=args.port).run()
 
     # plain serve mode (scripts / piped stdin)
     if store.enc_enabled() and not store.is_unlocked():
