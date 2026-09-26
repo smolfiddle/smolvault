@@ -324,17 +324,205 @@ class TestHTTP(unittest.TestCase):
         self.assertEqual(data, b"")
 
     def test_put_truncated_rejected(self):
-        # declare 10 but send 5 -> should be 400 and file not visible
-        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        # we need to send headers with Length 10 but body 5 then close
-        # use socket directly to simulate truncated
-        # simpler: use handler's verification: length != res.size -> 400
-        # we can send 5 bytes with header 10 but http.client will set body length 5, not 10
-        # So we test that mismatched size detection works via direct store check?
-        # Instead test that PUT with correct length works, and truncated via _Bounded not via HTTP here
-        # We'll just assert normal PUT then GET works (covered)
-        c.close()
-        self.assertTrue(True)
+        """Declare more Content-Length than we actually send, then hang up.
+        The server must answer 400, drop the files row, and leave no
+        orphaned chunks behind (the cleanup used to leak them)."""
+        declared = 4_000_000
+        k = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        k.sendall(f"PUT /trunc.bin HTTP/1.1\r\nHost: h\r\n"
+                  f"Content-Length: {declared}\r\n\r\n".encode())
+        k.sendall(b"A" * 300_000)
+        k.shutdown(socket.SHUT_WR)          # EOF: server sees fewer than declared
+        buf = b""
+        k.settimeout(5)
+        try:
+            while True:
+                chunk = k.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        except OSError:
+            pass
+        k.close()
+        self.assertIn(b"400", buf.split(b"\r\n")[0])
+        c = self.store.conn()
+        self.assertIsNone(self.store.lookup("/trunc.bin"))
+        # every chunk the partial ingest wrote must be gone: drop_file
+        # removes them, so gc has nothing left to reclaim
+        self.assertEqual(
+            c.execute("SELECT COUNT(*) FROM chunks").fetchone()[0], 0,
+            "truncated PUT left orphaned chunks behind")
+        self.assertEqual(self.store.stats()["stored"], 0)
+
+    def test_underscore_content_length_rejected(self):
+        # int("5_0") == 50 in Python; the wire header must not be that lenient
+        k = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        k.sendall(b"PUT /u.bin HTTP/1.1\r\nHost: h\r\nContent-Length: 5_0\r\n\r\nabcde")
+        k.settimeout(5)
+        resp = k.recv(1024)
+        k.close()
+        self.assertIn(b"400", resp.split(b"\r\n")[0])
+
+    def test_transfer_encoding_rejected(self):
+        # chunked bodies are not supported; must not be silently mis-framed
+        k = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        k.sendall(b"PUT /t.bin HTTP/1.1\r\nHost: h\r\n"
+                  b"Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+        k.settimeout(5)
+        resp = k.recv(1024)
+        k.close()
+        self.assertIn(b"501", resp.split(b"\r\n")[0])
+        self.assertIsNone(self.store.lookup("/t.bin"))
+
+    def test_duplicate_content_length_rejected(self):
+        # CL.CL desync: two conflicting lengths must not seal anything
+        k = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        k.sendall(b"PUT /z.bin HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n"
+                  b"Content-Length: 99\r\n\r\nhello")
+        k.settimeout(5)
+        resp = k.recv(1024)
+        k.close()
+        self.assertIn(b"400", resp.split(b"\r\n")[0])
+        self.assertIsNone(self.store.lookup("/z.bin"))
+
+    def test_delete_keepalive_not_corrupted(self):
+        """do_DELETE used to answer Content-Length: 0 *and* write a 24-byte
+        body, so the body desynchronised the next response on the socket."""
+        k = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        k.sendall(b"DELETE /a HTTP/1.1\r\nHost: h\r\n\r\n"
+                  b"DELETE /b HTTP/1.1\r\nHost: h\r\n\r\n")
+        k.settimeout(5)
+        buf = b""
+        try:
+            while True:
+                chunk = k.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        except OSError:
+            pass
+        k.close()
+        self.assertEqual(buf.count(b"HTTP/1.1 403"), 2, repr(buf))
+        # the 24-byte body is now *declared*, so each response is
+        # self-consistent and the second status line starts clean
+        self.assertEqual(buf.count(b"Content-Length: 24"), 2, repr(buf))
+        self.assertNotIn(b"Content-Length: 0", buf, repr(buf))
+        self.assertNotIn(b"disabledHTTP/1.1", buf, repr(buf))
+
+    def test_post_msg_rejects_non_object_json(self):
+        for body in (b"[]", b"null", b'"str"', b"5"):
+            st, _, _ = self.req("POST", "/__api/msg", body=body,
+                                headers={"Content-Length": str(len(body))})
+            self.assertIn(st, (400, 405), f"body={body!r} gave {st}")
+
+    def test_post_unknown_path_does_not_desync(self):
+        """A rejected POST must close or drain, never leave the body to be
+        parsed as the next request."""
+        k = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        k.sendall(b"POST /nope HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\n"
+                  b"helloGET /a HTTP/1.1\r\nHost: h\r\n\r\n")
+        k.settimeout(5)
+        buf = b""
+        try:
+            while True:
+                chunk = k.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        except OSError:
+            pass
+        k.close()
+        self.assertNotIn(b"helloGET", buf, repr(buf))
+
+    def test_range_digit_flood_returns_416(self):
+        self.req("PUT", "/flood.txt", body=b"abc",
+                 headers={"Content-Length": "3"})
+        st, _, hd = self.req("GET", "/flood.txt",
+                             headers={"Range": "bytes=0-" + "9" * 5000})
+        self.assertEqual(st, 416)
+        self.assertIn("content-range", hd)
+
+    def test_range_suffix_on_empty_file_is_416(self):
+        self.req("PUT", "/e.bin", body=b"", headers={"Content-Length": "0"})
+        st, _, _ = self.req("GET", "/e.bin", headers={"Range": "bytes=-5"})
+        self.assertEqual(st, 416, "0-byte file: suffix range is unsatisfiable")
+
+    def test_weak_etag_matched(self):
+        self.req("PUT", "/weak.txt", body=b"body", headers={"Content-Length": "4"})
+        etag = self.store.lookup("/weak.txt")["root_hash"]
+        st, d, _ = self.req("GET", "/weak.txt",
+                            headers={"If-None-Match": f'w/"{etag}"'})
+        self.assertEqual(st, 304, "W/ is case-insensitive per RFC 7232")
+        self.assertEqual(d, b"")
+        st, _, _ = self.req("GET", "/weak.txt",
+                            headers={"Range": "bytes=0-1",
+                                     "If-Range": f'w/"{etag}"'})
+        self.assertEqual(st, 206, "weak If-Range with a matching etag must 206")
+
+    def test_if_none_match_star(self):
+        self.req("PUT", "/star.txt", body=b"xy", headers={"Content-Length": "2"})
+        st, d, _ = self.req("GET", "/star.txt", headers={"If-None-Match": "*"})
+        self.assertEqual(st, 304)
+        self.assertEqual(d, b"")
+
+    def test_304_sends_no_content_length(self):
+        self.req("PUT", "/nl.txt", body=b"xy", headers={"Content-Length": "2"})
+        etag = self.store.lookup("/nl.txt")["root_hash"]
+        st, _, hd = self.req("GET", "/nl.txt",
+                             headers={"If-None-Match": f'"{etag}"'})
+        self.assertEqual(st, 304)
+        self.assertNotIn("content-length", hd,
+                         "RFC 7230 3.3.2 forbids Content-Length on 304")
+        self.assertIn("cache-control", hd)
+
+    def test_head_on_locked_vault_has_no_body(self):
+        try:
+            sv._Crypto.lib()
+        except sv.CryptoUnavailable:
+            self.skipTest("libcrypto unavailable")
+        W2 = tempfile.mkdtemp(prefix="svaudit_head_")
+        vault2 = os.path.join(W2, "h.vault")
+        s2 = sv.Store(vault2)
+        try:
+            s2.set_password("pw")
+            s2.enable_encryption("pw")
+            s2.put("/s.bin", io.BytesIO(b"secret"))
+            s2.set_auth_required(False)
+            locked = sv.Store(vault2)
+            port2 = free_port()
+            srv2 = make_server(locked, port2)
+            k = socket.create_connection(("127.0.0.1", port2), timeout=5)
+            k.sendall(b"HEAD /s.bin HTTP/1.1\r\nHost: h\r\n\r\n")
+            k.settimeout(5)
+            buf = b""
+            try:
+                while True:
+                    chunk = k.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+            except OSError:
+                pass
+            k.close()
+            self.assertIn(b"423", buf.split(b"\r\n")[0])
+            self.assertNotIn(b"vault locked", buf,
+                             "HEAD must never carry a body")
+            srv2.shutdown()
+            srv2.server_close()
+        finally:
+            shutil.rmtree(W2, ignore_errors=True)
+
+    def test_oversized_uri_does_not_crash_feed(self):
+        # 414 path used to AttributeError on self.path in the log line
+        k = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        k.sendall(b"GET /" + b"a" * 70000 + b" HTTP/1.1\r\nHost: h\r\n\r\n")
+        k.settimeout(5)
+        try:
+            resp = k.recv(4096)
+        except OSError:
+            resp = b""
+        k.close()
+        self.assertIn(b"414", resp.split(b"\r\n")[0])
 
     def test_worm_409(self):
         self.req("PUT", "/worm.txt", body=b"a", headers={"Content-Length": "1"})

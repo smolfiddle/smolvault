@@ -3,7 +3,7 @@
 [![python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
 [![dependencies](https://img.shields.io/badge/dependencies-zero-success)](#requirements)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-![version](https://img.shields.io/badge/version-0.3.3-lightgrey)
+![version](https://img.shields.io/badge/version-0.4.0-lightgrey)
 
 **smolvault is an immutable, content-addressed vault for everything you have —
 that speaks just enough HTTP to be mistaken for a local disk.**
@@ -52,9 +52,10 @@ Point it at a folder to ingest a whole tree — or `[b]` to open the
 starting at your current directory and **locked to it** (you can
 descend into subdirectories, never climb out). `↑↓` move · `→` descend
 · `←` up · Space toggles (on a folder = its whole subtree, `◐ n/m`
-while partial) · `a` select-all · live filter · `s` seals. Vault
-internals (`*.vault`, `__pycache__`) never appear. Then press `p` and
-start typing — results filter as you type:
+while partial) · `:a` select-all · `:u` clear · `:s` seal — every
+other printable key types into the filter. Vault internals (`*.vault`,
+`__pycache__`) never appear. Then press `p` and start typing — results
+filter as you type:
 
 ```
   watch ❯ dune · 2
@@ -70,8 +71,8 @@ phone and the same library streams there.
 
 ```
   ┌────────────────────────────────────────────────────────┐
-    smolvault 0.3.3
-     vault    vault.vault · 12 files · 22.3 GB logical · 11 GB stored
+    smolvault 0.4.0
+     vault    vault.vault  · 12 files · 22.3 GB logical · 11 GB stored
     local    http://127.0.0.1:8100/
     network  http://192.168.1.14:8100/   ● running   ← phone/TV ready
     auth     password protected · AES-256-GCM at rest
@@ -134,7 +135,7 @@ After each action the hub collapses to a one-line prompt —
   the encryption key wrapper, and the network gate it controls is an
   independent switch (`--auth on|off`) so trusted LANs can stream freely.
 - **Port picker at vault creation** — `port [8100]` (Enter=auto next free) via `prompt_for_port`, persisted per-vault; change anytime with `P` in wizard or `--port` / `$SMOLVAULT_PORT`.
-- **Tiny vault file manager** — `[b]rowse vault` in `play`/`get`/`library`/`info`/`copy` (and remote `watch`/`get`) — same raw-mode keys (`↑↓ → ← Enter i info`), live filter, backed by `VaultBrowseState` (prefix tree from `Store.list_dir`).
+- **Tiny vault file manager** — `[b]rowse vault` in `play`/`get`/`library`/`info`/`copy` (and remote `watch`/`get`) — same raw-mode keys (`↑↓ → ← Enter i info`), live filter, backed by `VaultBrowseState` (prefix tree from the listing, with the row carried through so the renderer stays O(1) per visible row). `get` and `library` open it in multi-select: Space to check, `:s` to act on everything checked.
 
 ## Requirements
 
@@ -227,7 +228,10 @@ first; in the wizard, `y sync` adds a LAN discovery picker.
 
 ## Configuration
 
-No config files — flags and environment only.
+No config files — flags and environment only. A few things are *remembered
+per vault* in its own SQLite `config` table (the last LAN port, whether the
+network gate is on, and an exposed `--share-root`); there is no separate
+config file to edit.
 
 | Env var | Purpose |
 |---|---|
@@ -267,33 +271,42 @@ No config files — flags and environment only.
 | Endpoint | Behaviour |
 |---|---|
 | `GET/HEAD /path` | full file or RFC 7233 range; canonical path (resolves `..`); `ETag`/`304`; `423` if vault locked |
-| `PUT /path` | seal a new file (`409` if exists — WORM; `400` on truncated `Content-Length`; `0-byte` allowed; `423` locked) |
+| `PUT /path` | seal a new file (`409` if exists — WORM; `400` on truncated `Content-Length`; `0-byte` allowed; `423` locked); answers `201` with `Location` |
 | `DELETE /path` | always `403` — WORM |
 | `GET /__api/list` | JSON listing (path, size, mime, created_at, root_hash) |
 | `POST /__api/msg` | post to the vault's message board `{"body": …}` → 201 (max 2000 chars, control chars stripped) |
 | `GET /__api/msg?since=N&limit=M` | board messages after id N (max 500) |
 | `GET /__api/browse?dir=` | listing under `--share-root` (403 when off / escaping) |
-| `GET /__api/browse?dir=&recursive=1` | internal recursive listing (used by remote picker) |
+| `GET /__api/browse?dir=&recursive=1` | internal recursive listing, capped at 2000 files (`"truncated": true` when capped) |
 | `POST /__api/ingest` | seal server-local files `{paths:[...max 200], into}` (max 2000 files, `409` WORM, `403` traversal/symlink) |
 | `GET /__api/auth` | `{"auth": bool, "share_root": bool}` — password gate + share-root presence |
+
+**A locked vault answers `423` to every endpoint**, `/__api/*` included — no
+metadata leaks through the listing endpoints.
+
+Framing is strict: a request carrying `Transfer-Encoding`, or two
+conflicting `Content-Length` headers, is rejected before any handler runs,
+and every error response either drains its request body or closes the
+connection. Ambiguous framing is how HTTP request smuggling starts.
 
 Auth (if set): HTTP Basic, PBKDF2-HMAC-SHA256, 100k iterations.
 Disable it for trusted LANs with `--auth off` — encryption stays on.
 
 ## Benchmarks
 
-Loopback · NVMe · 6 cores ([full sheet](BENCHMARKS.md), reproduce with
-`python3 benchmark.py`):
+Loopback · NVMe · 6 cores · Python 3.12 ([full sheet](BENCHMARKS.md),
+regenerate with `python3 benchmark.py`, ~7 min). Every figure below comes
+from that one committed run:
 
 | Metric | Result |
 |---|---|
-| Ingest (700 MB seal) | ~14 s (~51 MB/s) — media scans a hot stride |
+| Ingest (700 MB seal) | 20.5 s · 34.1 MB/s — media scans a hot stride |
 | Dedup | identical content → **+0 bytes**; WORM reject < 1 ms |
-| Full read 700 MB | **~150–550 MB/s** hash-verified (cold / warm cache) |
-| Concurrent reads | **230–725 MB/s** aggregate |
-| Range read p50/p95 | **~2–6 ms / 3–17 ms** (256 KB, keep-alive) |
-| Playback vs local disk | startup ≈+0.0–0.2 s · deep seek ≈+0.0 s |
-| Vault sync | push @ **13–35 MB/s** · no-op re-sync **< 25 ms** |
+| Full read 700 MB | 2.06 s · **339 MB/s** hash-verified |
+| Concurrent reads | 388 MB/s aggregate (4×64 MB) |
+| Range read p50/p95 | **1.8 ms / 5.3 ms** (256 KB, keep-alive) |
+| Playback vs local disk | startup +0.08 s · deep seek +0.01 s |
+| Vault sync | push 732 MB @ 13.7 MB/s · pull 192 MB @ 34.3 MB/s · no-op re-sync 24 ms |
 
 ### On a 1 GB box
 
@@ -308,7 +321,15 @@ sealed and streamed back out of it:
 | Seek p50/p95 | 5 ms / 21 ms |
 | Server peak memory | **~220–880 MB of 1024** (incl. reclaimable mmap 512 MB + cache 64 MB) — latest run `~226 MB` |
 
-> Note: `PRAGMA mmap_size=512M` + `cache_size=-64000` are tunable; `MemoryMax=1G` leaves headroom but a real Pi will ingest slower while the memory profile holds.
+> Note: `PRAGMA mmap_size=512M` + `cache_size=-64000` are tunable. The page-cache
+> figure is a *cap*, not a reservation — SQLite grows it lazily, so a
+> connection only holds the pages it actually touches. Lowering it to 2 MB
+> was measured and reverted: with a chunks index past the cap (~300k
+> chunks), range reads degrade p50 1.6 → 4.9 ms and p95 7.1 → 12.7 ms
+> (fresh process per setting, identical warm-up). Seeks are the whole point
+> of a media server, so leave it alone unless you have measured a problem.
+> `MemoryMax=1G` leaves headroom; a real Pi will ingest slower, while the
+> memory profile holds.
 
 Memory stays flat because files stream in chunks — the ceiling is your disk,
 not your RAM. Reproduce with `python3 benchmark.py --lowmem` (Linux +
@@ -317,27 +338,37 @@ silicon — a real Pi will ingest slower, but the memory profile holds.
 
 ### Resilience & scale
 
-Every promise the docs make, measured ([full sheet](BENCHMARKS.md)):
+Every promise the docs make, measured, from the same committed
+[full sheet](BENCHMARKS.md):
 
 | Promise | Measured |
 |---|---|
-| **CDC survives edits** — insert 1 MB mid-file into 192 MB, re-seal | **≈50–98% deduped** (varies with edit position/content) · effective write speed still *exceeds* naive copy |
-| **Small-file reality** — 1500 mixed 0–64 KB files | **370–544 files/s** · seal p50 0.5–1 ms |
-| **Library scale** — 10k / 50k entries | `--list` 7 / 70 ms · search 18 / 88 ms · `du` 5 / 22 ms |
-| **Reads don't block on writes** — 6 range-readers during a 256 MB PUT | 1560 reads · p50 **23 ms** / p95 63 ms while writer ran at 35 MB/s |
-| **WORM is race-safe** — 12 parallel PUTs, same path | exactly **1×201 + 11×409** in ~1 s, file serves intact after |
-| **Crash consistency** — `kill -9` mid-ingest, restart | pre-crash file byte-exact · half-written file invisible (`404`) · `--gc` reclaimed orphans · `--check` PASS |
-| **Multi-viewer storm** — 3 simultaneous decoders + seek noise | ≈**64 fps** aggregate · seek-noise p50 4.2 ms under load |
-| **Write endurance** — 5 GB sustained in 45 s | 113 MB/s mean · commit latency stable (259→293 ms p50) · WAL capped at 32 MB |
-| **At-rest encryption cost** — AES-256-GCM on/off | seals ≈14–25% slower (`+22%` measured) · reads within ~40% · range seeks `~2–3 ms p50` · unlock `~42–60 ms` |
-| **Message board** — post → readable | ~0.3 ms roundtrip |
-| **Remote ingest** — `--share-root`, 96 MB via one POST | **82.7 MB/s** server-side · 20-file batch in 160 ms · traversal/symlink → `403` |
-| **Remote ingest** — batch 20 × 512 KB in one POST | 20/20 sealed in `~160 ms` · re-ingest → `409` |
+| **CDC survives edits** — insert 1 MB mid-file into 192 MB, re-seal | **88.6% deduped** (varies with edit position/content) · naive copy 59.0 MB/s → **89.2 MB/s** effective |
+| **Small-file reality** — 1500 mixed 0–64 KB files | **315 files/s** · seal p50 0.8 ms · p95 2.0 ms |
+| **Library scale** — 10k / 50k entries | `--list` 30 / 140 ms · search 37 / 201 ms · `du` 9 / 41 ms |
+| **Reads don't block on writes** — 6 range-readers during a 700 MB PUT | 3123 reads · p50 **29 ms** / p95 93 ms while the writer ran |
+| **WORM is race-safe** — 12 parallel PUTs, same path | exactly **1×201 + 11×409** in 26 ms, file serves intact after |
+| **Crash consistency** — `kill -9` mid-ingest, restart | pre-crash file byte-exact · half-written file invisible (`404`) · `--gc` reclaimed the dead ingest's lease + 35 orphans · `--check` PASS |
+| **Concurrent gc vs ingest** — `--gc` while a seal runs | gc sees the live ingest lease and **defers**; a lease whose owning pid is gone is reclaimed immediately, so `kill -9` self-heals. Costs 2 extra SQL statements per seal: **−8% on 1500 small files** (704 vs 768 files/s), below the noise floor on media |
+| **Multi-viewer storm** — 3 simultaneous decoders + seek noise | ≈**67 fps** aggregate · seek-noise p50 7.3 ms under load |
+| **Write endurance** — 3.5 GB sustained in 45 s | 78.3 MB/s mean · commit latency stable (389→424 ms p50) · WAL capped at 32 MB |
+| **At-rest encryption cost** — AES-256-GCM on/off | seal **+37%** time · reads 148 vs 266 MB/s · range seeks `8.5 ms p50` · unlock `88 ms` |
+| **Message board** — post → readable | 13.1 ms roundtrip |
+| **Remote ingest** — `--share-root`, 96 MB via one POST | **36.0 MB/s** server-side · 20-file batch in 298 ms · traversal/symlink → `403` |
 
 The WORM race test earned its keep: it exposed a real bug (losing writers
 stalled 60 s on SQLite lock timeouts, then died without a response) which is
 now fixed with explicit single-writer discipline — contenders get instant
 `409`s instead.
+
+> **Reading these numbers.** Several sections seal `os.urandom` data, so
+> chunk counts and throughput move run to run — the CDC-resync dedup figure
+> alone has ranged 49–95% across runs purely on where the edit landed, and
+> the 700 MB seal has landed anywhere from 34 to 49 MB/s. On this hardware
+> the media-seal path has a pass-to-pass spread exceeding 2×, so treat
+> single-run deltas under ~20% as noise. The numbers above are one full run,
+> not a curated best-of; if a figure here looks unflattering, it unflattered
+> the run that is committed.
 
 ## Troubleshooting
 
@@ -379,11 +410,16 @@ sealed on disk.
 
 Passphrase strength matters: the key is only as strong as the password
 wrapping it (scrypt, n=2¹⁵). Password changes re-wrap the master key in
-milliseconds — data is never re-encrypted. The message board is visible
-to anyone holding the vault password and is not replicated by sync.
-`--share-root` grants password holders read+seal access to that one
-directory (traversal- and symlink-locked, additive-only, **persisted** in vault config) — point it at a downloads
-folder, never at `/` (`/` is now refused). Paths are canonicalized (`/a/../b` → `/b`), truncated uploads are rejected (`400`), and `gc` holds a write lock to avoid orphans.
+milliseconds — data is never re-encrypted. `--decrypt` refuses to drop key
+material while any chunk is still sealed, so a half-finished migration can
+never look like successful one. The message board is visible to anyone
+holding the vault password and is not replicated by sync. `--share-root`
+grants password holders read+seal access to that one directory
+(traversal- and symlink-locked, additive-only, **persisted** in vault
+config) — point it at a downloads folder, never at `/` (`/` is now
+refused). Paths are canonicalized (`/a/../b` → `/b`), truncated uploads are
+rejected (`400`) *and* rolled back, and `gc` holds a write lock plus an
+ingest lease to avoid orphans.
 
 ## Design notes
 smolvault is the distilled successor of DenseVault.

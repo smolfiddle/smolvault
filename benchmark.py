@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """smolvault benchmark suite — run from anywhere:
 
-    python3 benchmark.py [--quick] [--lowmem]
+    python3 benchmark.py [--quick] [--lowmem] [--no-write]
 
 Writes results to stdout and to BENCHMARKS.md next to this file.
+--no-write keeps BENCHMARKS.md untouched (what CI uses, so a run can
+never dirty the repo).
 Covers: engine micros, vault ingest/dedup, HTTP read/write paths,
 range patterns, concurrency, client API, maintenance, playback UX.
 --lowmem adds a constrained-hardware section (server inside a 1 GB
@@ -29,6 +31,7 @@ SMOL = os.path.join(HERE, "smolvault.py")
 PORT = 8891
 QUICK = "--quick" in sys.argv
 LOWMEM = "--lowmem" in sys.argv
+NO_WRITE = "--no-write" in sys.argv
 
 R = []
 def rec(section, label, value):
@@ -988,9 +991,16 @@ rec("crash", "half-written victim not visible", f"GET /victim.bin → {_head_pro
 
 p = subprocess.run([sys.executable, SMOL, cr_vault, "--gc"],
                    capture_output=True, text=True)
-orphans_line = [l for l in p.stdout.splitlines() if "gc:" in l]
+gc_lines = [l for l in p.stdout.splitlines() if "gc:" in l]
+# a kill -9 mid-ingest leaves the ingest lease behind, so the first gc line
+# is the lease reclaim and the orphan count is the one after it
+lease_line = [l for l in gc_lines if "lease" in l]
+orphan_line = [l for l in gc_lines if "lease" not in l]
+if lease_line:
+    rec("crash", "gc reclaims the dead ingest's lease",
+        lease_line[0].split("gc:")[-1].strip())
 rec("crash", "--gc reclaims orphaned chunks",
-    orphans_line[0].split("gc:")[-1].strip() if orphans_line else "(none found)")
+    orphan_line[0].split("gc:")[-1].strip() if orphan_line else "(none found)")
 
 p = subprocess.run([sys.executable, SMOL, cr_vault, "--check"],
                    capture_output=True, text=True)
@@ -1109,8 +1119,11 @@ NVMe SSD · loopback HTTP/1.1.
 """ + "\n".join(lines) + "\n"
 
 out_md = os.path.join(HERE, "BENCHMARKS.md")
-with open(out_md, "w") as f:
-    f.write(md)
-print(f"\nsaved -> {out_md}")
+if NO_WRITE:
+    print(f"\n--no-write: {out_md} left untouched")
+else:
+    with open(out_md, "w") as f:
+        f.write(md)
+    print(f"\nsaved -> {out_md}")
 
 subprocess.run(["rm", "-rf", W])
