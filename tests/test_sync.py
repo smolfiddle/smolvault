@@ -42,10 +42,6 @@ def serve(store, port):
     return srv
 
 
-def always_yes(*_a, **_k):
-    return "y"
-
-
 class SyncBase(unittest.TestCase):
     def setUp(self):
         self.W = tempfile.mkdtemp(prefix="svsync_")

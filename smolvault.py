@@ -85,7 +85,7 @@ import zlib
 from collections import Counter, namedtuple
 from socketserver import ThreadingMixIn
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 log = logging.getLogger("smolvault")
 
@@ -97,10 +97,8 @@ _feed_muted = threading.Event()    # set when a raw-mode view owns stdout
 # ---- compiled regexes / tunables (avoid per-request recompilation) ----
 _RANGE_RE = re.compile(r"\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*")
 _MOD_ARROW_RE = re.compile(r"\[1;\d+[ABCD]")
-WORM_MSG = "already sealed (WORM)"
 MAX_INGEST_PATHS = 200
 MAX_INGEST_JOBS = 2000
-DEBUG = os.environ.get("SMOLVAULT_DEBUG") not in (None, "", "0", "false", "False")
 
 # single gear table cached across Chunker instances (perf P-01)
 _GEAR_CACHE = None
@@ -958,6 +956,12 @@ class Store:
         # different-class files share no chunks anyway.
         probe = reader.read(STRIDE_PROBE)
         stride = STRIDE_HOT if _entropy(probe) >= ENTROPY_RAW else STRIDE_COLD
+        # The reader's *shape* is part of the chunking contract: the Chunker
+        # scans only as far as its buffer reaches, so cut positions depend on
+        # read sizes. Keep it fed as probe-then-*reader* (fixed 256 KiB probe,
+        # then the reader's own 4 MiB reads) — swapping in a buffered or
+        # whole-file reader silently changes every boundary, and with it
+        # dedup and resync, while still passing --check.
         stream = _PrefixedReader(probe, reader) if probe else reader
 
         for raw in Chunker(stride=stride).chunk(stream):
@@ -1392,7 +1396,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._sm_code = code
         super().send_response(code, message)
 
-    def log_message(self, fmt, *args):     # silence default logger
+    def log_message(self, message, *args):
+        """Silences the stdlib access log — the activity feed in
+        ``handle_one_request`` replaces it.
+
+        Both parameters are deliberately unused: ``log_request`` and
+        ``log_error`` in the stdlib funnel here, so the signature cannot be
+        narrowed even though nothing reads them. Kept as ``message`` rather
+        than ``fmt`` so it does not shadow the module-level size formatter
+        (the stdlib calls this positionally, so the name is ours to pick)."""
         pass
 
     # ---- request framing (CL.CL / TE desync) ------------------------------
@@ -2088,7 +2100,7 @@ def prompt_for_port(store, explicit=None):
         store.cfg_set("lan_port", suggested)
         return suggested
     # interactive prompt
-    for attempt in range(3):
+    for _ in range(3):
         try:
             raw = input(cyan(f"  port [{suggested}]: ")).strip()
         except (EOFError, KeyboardInterrupt):
@@ -2702,7 +2714,7 @@ def play_url(url, mime=None, player=None):
         return EXIT_OK
 
 
-def watch_flow(spawn, path, all_paths, player):
+def watch_flow(spawn, path, all_paths):
     """Play *path*, then offer next/previous/replay until the user quits.
     *spawn(url)* runs the player synchronously. Returns exit code."""
     current = path
@@ -4310,18 +4322,12 @@ class Wizard:
         _feed_muted.set()
         try:
             watch_flow(spawn, path, [r["path"] for r in
-                                     self.store.all_files()],
-                       explicit_player or "mpv")
+                                     self.store.all_files()])
         finally:
             _feed_muted.clear()
             if ephemeral:
                 ephemeral.shutdown()
                 ephemeral.server_close()
-
-    def do_info(self):
-        q = self.ask("  file (path or search term): ")
-        if q:
-            show_info(self.store, q)
 
     def do_get(self):
         # tiny file manager for get — [b]rowse vault (multi: export many)
@@ -4412,7 +4418,7 @@ class Wizard:
         print(bold(f"\n  smolvault {__version__}\n"))
         try:
             if self.store.enc_enabled():
-                for attempt in range(3):
+                for _ in range(3):
                     pw = getpass.getpass(
                         dim(f"  {self.vault} — password to unlock: ")).strip()
                     if not pw:
@@ -4607,7 +4613,7 @@ class Wizard:
             "g": self.do_get, "c": self.do_copy,
             "y": self.do_sync, "S": self.do_server,
             "P": self.do_port,
-            "v": lambda: self._verify(),
+            "v": self._verify,
         }
         fn = actions.get(key)                  # case matters: 'S' = server
         if fn:
@@ -5268,8 +5274,7 @@ def run_client(spec, player=None):
                         return play_url(_rv.cred_url(p), mime, _pl)
 
                     watch_flow(spawn, path,
-                               [r["path"] for r in rows],
-                               explicit_pl or "mpv")
+                               [r["path"] for r in rows])
                 elif key == "i":
                     q = input("  file [b]rowse vault or type path/term: ").strip()
                     if q.lower() in ("b", "browse"):
@@ -5531,7 +5536,7 @@ def build_parser():
     return ap
 
 
-def _unlock_for_maintenance(store, password, vault):
+def _unlock_for_maintenance(store, password):
     """Unlock an encrypted vault for --check/--gc, or say why we can't.
 
     Returns True when the vault is usable (including when it was never
@@ -5579,7 +5584,7 @@ def main(argv=None):
         store = Store(args.vault)
         # an encrypted vault needs unlocking before either can run; without
         # this, --check died with a raw LockedVault traceback
-        if not _unlock_for_maintenance(store, args.password, args.vault):
+        if not _unlock_for_maintenance(store, args.password):
             return EXIT_NOMATCH
         if args.check:
             return EXIT_OK if store.check() else EXIT_NOMATCH
@@ -5746,7 +5751,7 @@ def main(argv=None):
         if not targets:
             return EXIT_NOMATCH
         h, p_, _i = targets[0]
-        return sync_vault(store, d := ("to" if args.sync_to else "from"),
+        return sync_vault(store, "to" if args.sync_to else "from",
                           h, int(p_), assume_yes=True)
 
     # ---- flag mode ------------------------------------------------------
