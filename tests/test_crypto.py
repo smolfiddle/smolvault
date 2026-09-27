@@ -256,8 +256,8 @@ class TestMaintenanceUnlocks(unittest.TestCase):
         st = sv.Store(self.vault)
         self.assertTrue(st.enc_enabled())
         self.assertFalse(st.is_unlocked())
-        self.assertFalse(sv._unlock_for_maintenance(st, "wrong", self.vault))
-        self.assertTrue(sv._unlock_for_maintenance(st, "pw", self.vault))
+        self.assertFalse(sv._unlock_for_maintenance(st, "wrong"))
+        self.assertTrue(sv._unlock_for_maintenance(st, "pw"))
         self.assertTrue(st.is_unlocked())
 
 

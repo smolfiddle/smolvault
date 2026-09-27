@@ -3,7 +3,7 @@
 [![python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
 [![dependencies](https://img.shields.io/badge/dependencies-zero-success)](#requirements)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-![version](https://img.shields.io/badge/version-0.4.0-lightgrey)
+![version](https://img.shields.io/badge/version-0.4.1-lightgrey)
 
 **smolvault is an immutable, content-addressed vault for everything you have —
 that speaks just enough HTTP to be mistaken for a local disk.**
@@ -71,7 +71,7 @@ phone and the same library streams there.
 
 ```
   ┌────────────────────────────────────────────────────────┐
-    smolvault 0.4.0
+    smolvault 0.4.1
      vault    vault.vault  · 12 files · 22.3 GB logical · 11 GB stored
     local    http://127.0.0.1:8100/
     network  http://192.168.1.14:8100/   ● running   ← phone/TV ready
@@ -429,6 +429,16 @@ pipelines (measured slower on boost-heavy consumer CPUs — the GIL-bound
 chunker runs fastest alone). Deliberately kept verbatim: the gear-hash
 chunker and hash-verified reads; the entropy gate now also picks each
 file's sealing stride.
+
+**One invariant worth knowing if you ever touch the ingest path.** The
+chunker scans only as far as its buffer reaches, so cut positions depend on
+*read sizes* as well as content. Ingest always feeds it a 256 KiB entropy
+probe followed by the reader's own 4 MiB reads, which is what makes chunking
+deterministic and dedup/resync work. Swapping in a buffered or whole-file
+reader would silently move every boundary — and `--check` would still pass,
+because each chunk stays internally consistent. If you change how `_put`
+builds its reader, re-measure the CDC-resync dedup row in
+[BENCHMARKS.md](BENCHMARKS.md) before trusting it.
 
 ### How it compares
 

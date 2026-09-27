@@ -56,9 +56,18 @@ class TestDeadCode(unittest.TestCase):
         self.assertFalse(hasattr(sv.BrowseState, "_rel"), "_rel should be removed")
 
     def test_compiled_regexes_exist(self):
+        # these two are on the per-request hot path, so their existence is
+        # worth pinning. WORM_MSG used to be pinned here too, but nothing
+        # ever read it — a hasattr assertion kept dead code looking alive.
         self.assertTrue(hasattr(sv, "_RANGE_RE"))
         self.assertTrue(hasattr(sv, "_MOD_ARROW_RE"))
-        self.assertTrue(hasattr(sv, "WORM_MSG"))
+
+    def test_vestigial_constants_removed(self):
+        # kept alive only by hasattr assertions, which is worse than no
+        # test at all: it conceals the dead code
+        for name in ("WORM_MSG", "DEBUG"):
+            self.assertFalse(hasattr(sv, name),
+                             f"{name} is vestigial and should be gone")
 
     def test_gear_cache(self):
         # two chunkers should share same gear tuple (caching)
@@ -68,8 +77,11 @@ class TestDeadCode(unittest.TestCase):
         c3 = sv.Chunker(stride=64)
         self.assertIs(c1.gear, c3.gear)
 
-    def test_debug_constant(self):
-        self.assertTrue(hasattr(sv, "DEBUG"))
+    def test_unreachable_method_removed(self):
+        # the `i` key dispatches to the inner _do_info closure, so this
+        # method was never reachable
+        self.assertFalse(hasattr(sv.Wizard, "do_info"),
+                         "Wizard.do_info is dead — `i` uses _do_info")
 
 
 class TestNorm(unittest.TestCase):
