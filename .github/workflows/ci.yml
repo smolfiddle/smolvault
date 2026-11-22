@@ -2,7 +2,10 @@ name: ci
 on: [push, pull_request]
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Python 3.9 has no prebuilt x64 toolchain for Ubuntu 26.04 (the
+    # current ubuntu-latest). 24.04 is the newest image that still ships
+    # 3.9 builds; pin it so the 3.9 matrix leg can resolve.
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python: ["3.9", "3.12"]
