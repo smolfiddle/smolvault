@@ -3,7 +3,7 @@
 [![python](https://img.shields.io/badge/python-3.9%2B-blue)](#requirements)
 [![dependencies](https://img.shields.io/badge/dependencies-zero-success)](#requirements)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-![version](https://img.shields.io/badge/version-0.4.1-lightgrey)
+![version](https://img.shields.io/badge/version-0.4.2-lightgrey)
 
 **smolvault is an immutable, content-addressed vault for everything you have —
 that speaks just enough HTTP to be mistaken for a local disk.**
@@ -71,7 +71,7 @@ phone and the same library streams there.
 
 ```
   ┌────────────────────────────────────────────────────────┐
-    smolvault 0.4.1
+    smolvault 0.4.2
      vault    vault.vault  · 12 files · 22.3 GB logical · 11 GB stored
     local    http://127.0.0.1:8100/
     network  http://192.168.1.14:8100/   ● running   ← phone/TV ready
@@ -241,6 +241,7 @@ config file to edit.
 | `SMOLVAULT_DEBUG` | verbose debug output + SIGUSR1 stack dumps |
 | `SMOLVAULT_NAME` | node name on the message board (else hostname) |
 | `SMOLVAULT_PORT` | default port at vault creation (else auto next free) |
+| `SMOLVAULT_WAL_CHECKPOINT` | SQLite WAL auto-checkpoint threshold in pages (`0` disables it). SQLite's default (~4 MB) checkpoints mid-seal; raising it to e.g. `100000` measured ~1.5× faster seals (64 MB: 69 → 105 MB/s) at the cost of a WAL that grows to roughly one file's size before checkpoint. Leave unset on small-RAM boxes. |
 | `NO_COLOR` | disable ANSI color everywhere |
 
 | Flag | Effect |
@@ -281,8 +282,10 @@ config file to edit.
 | `POST /__api/ingest` | seal server-local files `{paths:[...max 200], into}` (max 2000 files, `409` WORM, `403` traversal/symlink) |
 | `GET /__api/auth` | `{"auth": bool, "share_root": bool}` — password gate + share-root presence |
 
-**A locked vault answers `423` to every endpoint**, `/__api/*` included — no
-metadata leaks through the listing endpoints.
+**A locked vault answers `423` to every endpoint that reaches the vault**,
+`/__api/*` included — no metadata leaks through the listing endpoints. When
+the network gate is on (`--auth on`, the default), an *unauthenticated*
+request is answered `401` before the lock check; `OPTIONS` is always `200`.
 
 Framing is strict: a request carrying `Transfer-Encoding`, or two
 conflicting `Content-Length` headers, is rejected before any handler runs,
@@ -294,23 +297,24 @@ Disable it for trusted LANs with `--auth off` — encryption stays on.
 
 ## Benchmarks
 
-Loopback · NVMe · 6 cores · Python 3.12 ([full sheet](BENCHMARKS.md),
-regenerate with `python3 benchmark.py`, ~7 min). Every figure below comes
-from that one committed run:
+Loopback · 6 cores · Python 3.12 ([full sheet](BENCHMARKS.md), regenerate
+with `python3 benchmark.py`; use `--skip-heavy` on a memory-constrained
+box). Every figure in the tables below comes from that one committed run:
 
 | Metric | Result |
 |---|---|
-| Ingest (700 MB seal) | 20.5 s · 34.1 MB/s — media scans a hot stride |
+| Ingest (700 MB seal) | 18.4 s · 38.0 MB/s — media scans a hot stride |
 | Dedup | identical content → **+0 bytes**; WORM reject < 1 ms |
-| Full read 700 MB | 2.06 s · **339 MB/s** hash-verified |
-| Concurrent reads | 388 MB/s aggregate (4×64 MB) |
-| Range read p50/p95 | **1.8 ms / 5.3 ms** (256 KB, keep-alive) |
-| Playback vs local disk | startup +0.08 s · deep seek +0.01 s |
-| Vault sync | push 732 MB @ 13.7 MB/s · pull 192 MB @ 34.3 MB/s · no-op re-sync 24 ms |
+| Full read 700 MB | 1.48 s · **473.7 MB/s** hash-verified |
+| Concurrent reads | 576 MB/s aggregate (4×64 MB) |
+| Range read p50/p95 | **1.6 ms / 5.5 ms** (256 KB, keep-alive) |
+| Playback vs local disk | startup +0.01 s · deep seek +0.01 s |
+| Vault sync | push 2077 MB @ 63.3 MB/s · pull 192 MB @ 29.9 MB/s · no-op re-sync 31 ms |
 
 ### On a 1 GB box
 
-The server itself runs inside a hard **1 GB RAM / no-swap / 4-core** cgroup
+From a separate `python3 benchmark.py --lowmem` run (not part of the
+committed full sheet). The server runs inside a hard **1 GB RAM / no-swap / 4-core** cgroup
 envelope (`systemd-run --user -p MemoryMax=1G`) while a 700 MB movie is
 sealed and streamed back out of it:
 
@@ -343,18 +347,18 @@ Every promise the docs make, measured, from the same committed
 
 | Promise | Measured |
 |---|---|
-| **CDC survives edits** — insert 1 MB mid-file into 192 MB, re-seal | **88.6% deduped** (varies with edit position/content) · naive copy 59.0 MB/s → **89.2 MB/s** effective |
-| **Small-file reality** — 1500 mixed 0–64 KB files | **315 files/s** · seal p50 0.8 ms · p95 2.0 ms |
-| **Library scale** — 10k / 50k entries | `--list` 30 / 140 ms · search 37 / 201 ms · `du` 9 / 41 ms |
-| **Reads don't block on writes** — 6 range-readers during a 700 MB PUT | 3123 reads · p50 **29 ms** / p95 93 ms while the writer ran |
-| **WORM is race-safe** — 12 parallel PUTs, same path | exactly **1×201 + 11×409** in 26 ms, file serves intact after |
-| **Crash consistency** — `kill -9` mid-ingest, restart | pre-crash file byte-exact · half-written file invisible (`404`) · `--gc` reclaimed the dead ingest's lease + 35 orphans · `--check` PASS |
-| **Concurrent gc vs ingest** — `--gc` while a seal runs | gc sees the live ingest lease and **defers**; a lease whose owning pid is gone is reclaimed immediately, so `kill -9` self-heals. Costs 2 extra SQL statements per seal: **−8% on 1500 small files** (704 vs 768 files/s), below the noise floor on media |
-| **Multi-viewer storm** — 3 simultaneous decoders + seek noise | ≈**67 fps** aggregate · seek-noise p50 7.3 ms under load |
-| **Write endurance** — 3.5 GB sustained in 45 s | 78.3 MB/s mean · commit latency stable (389→424 ms p50) · WAL capped at 32 MB |
-| **At-rest encryption cost** — AES-256-GCM on/off | seal **+37%** time · reads 148 vs 266 MB/s · range seeks `8.5 ms p50` · unlock `88 ms` |
-| **Message board** — post → readable | 13.1 ms roundtrip |
-| **Remote ingest** — `--share-root`, 96 MB via one POST | **36.0 MB/s** server-side · 20-file batch in 298 ms · traversal/symlink → `403` |
+| **CDC survives edits** — insert 1 MB mid-file into 192 MB, re-seal | **49.5% deduped** (varies with edit position/content) · naive copy 50.3 MB/s → **103.7 MB/s** effective |
+| **Small-file reality** — 1500 mixed 0–64 KB files | **405 files/s** · seal p50 0.5 ms · p95 1.3 ms |
+| **Library scale** — 10k / 50k entries | `--list` 17 / 101 ms · search 19.7 / 98.3 ms · `du` 3 / 14 ms |
+| **Reads don't block on writes** — 6 range-readers during a 700 MB PUT | 2291 reads · p50 **22.1 ms** / p95 64.5 ms while the writer ran |
+| **WORM is race-safe** — 12 parallel PUTs, same path | exactly **1×201 + 11×409** in 44 ms, file serves intact after |
+| **Crash consistency** — `kill -9` mid-ingest, restart | pre-crash file byte-exact · half-written file invisible (`404`) · `--gc` reclaimed the dead ingest's lease + 133 orphans · `--check` PASS |
+| **Concurrent gc vs ingest** — `--gc` while a seal runs | gc sees the live ingest lease and **defers**; the writer refreshes its lease timestamp in the same transaction as every chunk batch (no extra commit), a lease whose owner is gone is reclaimed immediately, so `kill -9` self-heals |
+| **Multi-viewer storm** — 3 simultaneous decoders + seek noise | ≈**67 fps** aggregate · seek-noise p50 4.7 ms under load |
+| **Write endurance** — 7.0 GB sustained in 45 s | 158.8 MB/s mean · commit latency stable (194→199 ms p50) · WAL capped at 32 MB |
+| **At-rest encryption cost** — AES-256-GCM on/off | seal **+7%** time · reads 205 vs 469 MB/s · range seeks `2.4 ms p50` · unlock `69 ms` |
+| **Message board** — post → readable | 0.44 ms roundtrip |
+| **Remote ingest** — `--share-root`, 96 MB via one POST | **67.2 MB/s** server-side · 20-file batch in 182 ms · traversal/symlink → `403` |
 
 The WORM race test earned its keep: it exposed a real bug (losing writers
 stalled 60 s on SQLite lock timeouts, then died without a response) which is
@@ -366,9 +370,11 @@ now fixed with explicit single-writer discipline — contenders get instant
 > alone has ranged 49–95% across runs purely on where the edit landed, and
 > the 700 MB seal has landed anywhere from 34 to 49 MB/s. On this hardware
 > the media-seal path has a pass-to-pass spread exceeding 2×, so treat
-> single-run deltas under ~20% as noise. The numbers above are one full run,
-> not a curated best-of; if a figure here looks unflattering, it unflattered
-> the run that is committed.
+> single-run deltas under ~20% as noise. Sections run in a fixed order, so
+> later ones inherit a warm CPU while the "best of 2" seal runs early —
+> do not read a seal-vs-PUT difference as a property of the code path. The
+> numbers above are one full run, not a curated best-of; if a figure here
+> looks unflattering, it unflattered the run that is committed.
 
 ## Troubleshooting
 
@@ -409,10 +415,12 @@ switch (`--auth on|off`, default on). Media-server on a trusted LAN?
 sealed on disk.
 
 Passphrase strength matters: the key is only as strong as the password
-wrapping it (scrypt, n=2¹⁵). Password changes re-wrap the master key in
-milliseconds — data is never re-encrypted. `--decrypt` refuses to drop key
-material while any chunk is still sealed, so a half-finished migration can
-never look like successful one. The message board is visible to anyone
+wrapping it (scrypt, n=2¹⁵). There is currently no password-change command —
+the password is set when the vault is created and cannot be rotated without
+re-sealing the vault. `--decrypt` refuses to drop key material while any
+chunk (or board message) is still sealed, so a half-finished migration can
+never look like a successful one; it also unseals the board and then drops
+the keys. The message board is visible to anyone
 holding the vault password and is not replicated by sync. `--share-root`
 grants password holders read+seal access to that one directory
 (traversal- and symlink-locked, additive-only, **persisted** in vault
@@ -438,7 +446,11 @@ deterministic and dedup/resync work. Swapping in a buffered or whole-file
 reader would silently move every boundary — and `--check` would still pass,
 because each chunk stays internally consistent. If you change how `_put`
 builds its reader, re-measure the CDC-resync dedup row in
-[BENCHMARKS.md](BENCHMARKS.md) before trusting it.
+[BENCHMARKS.md](BENCHMARKS.md) before trusting it. The gear-hash scan may
+be reorganised for speed (the current two-phase version is verified
+byte-for-byte against the original scanner in `tests/test_fixes.py`) —
+but any change that moves a boundary changes what deduplicates with
+vaults sealed before it.
 
 ### How it compares
 

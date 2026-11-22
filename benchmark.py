@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """smolvault benchmark suite — run from anywhere:
 
-    python3 benchmark.py [--quick] [--lowmem] [--no-write]
+    python3 benchmark.py [--quick] [--lowmem] [--no-write] [--skip-heavy]
 
 Writes results to stdout and to BENCHMARKS.md next to this file.
 --no-write keeps BENCHMARKS.md untouched (what CI uses, so a run can
-never dirty the repo).
+never dirty the repo). --skip-heavy omits the resilience/storm/soak
+sections for memory-constrained boxes; their rows are recorded as skipped.
 Covers: engine micros, vault ingest/dedup, HTTP read/write paths,
 range patterns, concurrency, client API, maintenance, playback UX.
 --lowmem adds a constrained-hardware section (server inside a 1 GB
 no-swap systemd cgroup scope; needs Linux + a user systemd session).
 """
+import atexit
 import glob
 import hashlib
 import http.client
@@ -18,6 +20,8 @@ import io
 import json
 import os
 import random
+import signal
+import shutil
 import socket
 import subprocess
 import sys
@@ -32,6 +36,10 @@ PORT = 8891
 QUICK = "--quick" in sys.argv
 LOWMEM = "--lowmem" in sys.argv
 NO_WRITE = "--no-write" in sys.argv
+# The last three sections (kill -9 recovery, 3 mpv decodes, 45 s soak) are
+# the memory-heavy ones. Skip them on a constrained box; run them in a
+# separate pass when there is RAM to spare.
+SKIP_HEAVY = "--skip-heavy" in sys.argv
 
 R = []
 def rec(section, label, value):
@@ -123,6 +131,40 @@ hr("VAULT · INGEST / DEDUP / READ (direct API)")
 W = tempfile.mkdtemp(prefix="svbench_")
 VAULT = os.path.join(W, "bench.vault")
 store = sv.Store(VAULT)
+
+# A timeout or Ctrl+C used to strand a multi-GB scratch vault and a few
+# child servers. Track both and clean them up on *every* exit path,
+# including SIGTERM from `timeout`.
+CHILDREN = []
+
+
+def spawn(*args, **kwargs):
+    p = subprocess.Popen(*args, **kwargs)
+    CHILDREN.append(p)
+    return p
+
+
+def cleanup():
+    for p in CHILDREN:
+        if p.poll() is None:
+            p.terminate()
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+    shutil.rmtree(W, ignore_errors=True)
+
+
+atexit.register(cleanup)
+
+
+def _on_sigterm(signum, frame):
+    print(f"\nbenchmark interrupted by signal {signum}; cleaning up…",
+          file=sys.stderr, flush=True)
+    sys.exit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, _on_sigterm)
 
 BIG = (256 if QUICK else 700) * 1024 * 1024
 bigfile = os.path.join(W, "big.bin")
@@ -243,8 +285,7 @@ dt_l = (time.perf_counter() - t0) * 1000
 rec("small", "metadata ops @1.5k files",
     f"search {dt_s:.1f} ms ({len(hits)} hits) · du {dt_d:.1f} ms · "
     f"list payload {mb(len(payload)):.2f} MB built in {dt_l:.1f} ms")
-import shutil as _sh
-_sh.rmtree(W3, ignore_errors=True)
+shutil.rmtree(W3, ignore_errors=True)
 
 # ------------------------------------------------------- library scale curve
 hr("SCALE · metadata latency vs library size")
@@ -287,7 +328,7 @@ os.unlink(scale_vault)
 # ------------------------------------------------------------------ HTTP
 hr("HTTP SERVER (live)")
 PORT = free_port(8891)
-srv = subprocess.Popen(
+srv = spawn(
     [sys.executable, "-u", SMOL, VAULT, "--serve", "--host", "127.0.0.1",
      "--port", str(PORT)],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -531,7 +572,7 @@ peer_store = sv.Store(PEER_VAULT)
 PEER_PAYLOAD = (64 if QUICK else 192) * 1048576
 peer_store.put("/peer/peerfile.bin", io.BytesIO(os.urandom(PEER_PAYLOAD)))
 
-peer_srv = subprocess.Popen(
+peer_srv = spawn(
     [sys.executable, "-u", SMOL, PEER_VAULT, "--serve", "--host",
      "127.0.0.1", "--port", str(PEER_PORT)],
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -544,10 +585,16 @@ while time.time() < end:
     except OSError:
         time.sleep(0.2)
 
+# The vault has accumulated files from every earlier section, so the old
+# `BIG + SIZE` constant labelled a 2 GB push as "732 MB" and understated
+# throughput by the same factor. Measure the real gap-filling set.
+peer_paths = {r["path"] for r in peer_store.all_files()}
+moved = sum(r["size"] for r in store.all_files()
+            if r["path"] not in peer_paths)
+
 t0 = time.perf_counter()
 rc = sv.sync_vault(store, "to", "127.0.0.1", PEER_PORT, assume_yes=True)
 dt = time.perf_counter() - t0
-moved = BIG + SIZE
 rec("sync", f"push {mb(moved):.0f} MB → peer",
     f"{'OK' if rc == 0 else 'FAIL'} · {dt:.1f}s · {mb(moved)/dt:.1f} MB/s")
 
@@ -597,7 +644,7 @@ if shutil_ok := __import__("shutil").which("mpv"):
         subprocess.run(cmd, capture_output=True)
         return time.perf_counter() - t0
 
-    srv = subprocess.Popen(
+    srv = spawn(
         [sys.executable, "-u", SMOL, VAULT, "--serve", "--host",
          "127.0.0.1", "--port", str(free_port(PORT + 1))],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -737,7 +784,7 @@ if hasattr(sv.Store, "enable_encryption"):
             .write(os.urandom(1024 * 512))
 
     RI_PORT = free_port(PORT + 5)
-    ri_srv = subprocess.Popen(
+    ri_srv = spawn(
         [sys.executable, "-u", SMOL, VAULT, "--serve",
          "--host", "127.0.0.1", "--port", str(RI_PORT),
          "--share-root", share_dir],
@@ -836,7 +883,7 @@ if LOWMEM:
     else:
         UNIT = f"smolbench-lowmem-{os.getpid()}"
         LM_PORT = free_port(PORT + 3)
-        scope = subprocess.Popen(
+        scope = spawn(
             ["systemd-run", "--user", "--scope", "--unit", UNIT,
              "-p", "MemoryMax=1G", "-p", "MemorySwapMax=0",
              "-p", "CPUQuota=400%",
@@ -919,179 +966,185 @@ if LOWMEM:
 else:
     pass  # --lowmem not requested
 
-# ------------------------------------------------------------- resilience
-hr("RESILIENCE · kill -9 mid-ingest, then recover")
-CR_PORT = free_port(PORT + 4)
-cr_vault = os.path.join(W, "crash.vault")
-crash_blob = os.urandom(320 * 1024 * 1024)
-crash_srv = subprocess.Popen(
-    [sys.executable, "-u", SMOL, cr_vault, "--serve",
-     "--host", "127.0.0.1", "--port", str(CR_PORT)],
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-end = time.time() + 15
-while time.time() < end:
-    try:
-        cc = http.client.HTTPConnection("127.0.0.1", CR_PORT, timeout=1)
-        cc.request("OPTIONS", "/"); cc.getresponse().read(); cc.close()
-        break
-    except OSError:
-        time.sleep(0.2)
-
-pre_hash = hashlib.sha256(crash_blob[:64 * 1024 * 1024]).hexdigest()
-cstore = sv.Store(cr_vault)                    # seal INTO the crash vault
-cstore.put("/safe.bin", io.BytesIO(crash_blob[:64 * 1024 * 1024]))
-cstore.conn().close()
-
-
-def crash_upload():
-    conn = http.client.HTTPConnection("127.0.0.1", CR_PORT, timeout=300)
-    try:
-        conn.request("PUT", "/victim.bin", body=io.BytesIO(crash_blob),
-                     headers={"Content-Length": str(len(crash_blob))})
-    except OSError:
-        pass                                   # server died mid-read: expected
-    finally:
-        conn.close()
-
-
-th = threading.Thread(target=crash_upload); th.start()
-time.sleep(3.5)                                 # get well into the transfer…
-crash_srv.kill(); crash_srv.wait()
-th.join()
-
-crash_srv = subprocess.Popen(                    # restart on same vault
-    [sys.executable, "-u", SMOL, cr_vault, "--serve",
-     "--host", "127.0.0.1", "--port", str(CR_PORT)],
-    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-end = time.time() + 15
-while time.time() < end:
-    try:
-        cc = http.client.HTTPConnection("127.0.0.1", CR_PORT, timeout=1)
-        cc.request("OPTIONS", "/"); cc.getresponse().read(); cc.close()
-        break
-    except OSError:
-        time.sleep(0.2)
-
-st_head = None
-cc = http.client.HTTPConnection("127.0.0.1", CR_PORT, timeout=60)
-cc.request("GET", "/safe.bin")
-r_ = cc.getresponse()
-back = r_.read(); cc.close()
-rec("crash", "pre-crash file byte-exact after restart",
-    f"{r_.status} · {mb(len(back)):.0f} MB · "
-    f"sha={'OK' if hashlib.sha256(back).hexdigest() == pre_hash else 'BAD'}")
-
-def _head_probe(path):
-    c3 = http.client.HTTPConnection("127.0.0.1", CR_PORT, timeout=10)
-    c3.request("GET", path)
-    rr = c3.getresponse(); rr.read(); stt = rr.status; c3.close()
-    return stt
-
-rec("crash", "half-written victim not visible", f"GET /victim.bin → {_head_probe('/victim.bin')} (expect 404)")
-
-p = subprocess.run([sys.executable, SMOL, cr_vault, "--gc"],
-                   capture_output=True, text=True)
-gc_lines = [l for l in p.stdout.splitlines() if "gc:" in l]
-# a kill -9 mid-ingest leaves the ingest lease behind, so the first gc line
-# is the lease reclaim and the orphan count is the one after it
-lease_line = [l for l in gc_lines if "lease" in l]
-orphan_line = [l for l in gc_lines if "lease" not in l]
-if lease_line:
-    rec("crash", "gc reclaims the dead ingest's lease",
-        lease_line[0].split("gc:")[-1].strip())
-rec("crash", "--gc reclaims orphaned chunks",
-    orphan_line[0].split("gc:")[-1].strip() if orphan_line else "(none found)")
-
-p = subprocess.run([sys.executable, SMOL, cr_vault, "--check"],
-                   capture_output=True, text=True)
-tail = [l for l in p.stdout.splitlines() if "chunks checked" in l]
-rec("crash", "--check after recovery",
-    f"{'PASS' if p.returncode == 0 else 'FAIL'} · "
-    f"{tail[0].strip().split('  ', 1)[1] if tail else '?'}")
-crash_srv.terminate()
-
-hr("STORM · three simultaneous mpv viewers + seek noise")
-sample_path = os.path.join(W, "sample.mp4")
-shutil_ok = __import__("shutil").which("mpv")
-if os.path.exists(sample_path) and shutil_ok:
-    STORM_PORT = free_port(PORT + 6)
-    storm_srv = subprocess.Popen(
-        [sys.executable, "-u", SMOL, VAULT, "--serve",
-         "--host", "127.0.0.1", "--port", str(STORM_PORT)],
+if SKIP_HEAVY:
+    for sec in ("crash", "storm", "soak"):
+        rec(sec, f"{sec} suite",
+            "skipped (--skip-heavy; re-run without the flag)")
+else:
+    # ------------------------------------------------------------- resilience
+    hr("RESILIENCE · kill -9 mid-ingest, then recover")
+    CR_PORT = free_port(PORT + 4)
+    cr_vault = os.path.join(W, "crash.vault")
+    crash_blob = os.urandom(320 * 1024 * 1024)
+    crash_srv = spawn(
+        [sys.executable, "-u", SMOL, cr_vault, "--serve",
+         "--host", "127.0.0.1", "--port", str(CR_PORT)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     end = time.time() + 15
     while time.time() < end:
         try:
-            cc = http.client.HTTPConnection("127.0.0.1", STORM_PORT, timeout=1)
+            cc = http.client.HTTPConnection("127.0.0.1", CR_PORT, timeout=1)
             cc.request("OPTIONS", "/"); cc.getresponse().read(); cc.close()
             break
         except OSError:
             time.sleep(0.2)
-    storm_url = f"http://127.0.0.1:{STORM_PORT}/media/sample.mp4"
-    noise_stop = [False]
-    noise_lat = []
 
-    def noise():
-        c4 = http.client.HTTPConnection("127.0.0.1", STORM_PORT, timeout=30)
-        rnd = random.Random(99)
-        while not noise_stop[0]:
-            off = rnd.randrange(0, max(1, os.path.getsize(sample_path) - 262144))
-            ts = time.perf_counter()
+    pre_hash = hashlib.sha256(crash_blob[:64 * 1024 * 1024]).hexdigest()
+    cstore = sv.Store(cr_vault)                    # seal INTO the crash vault
+    cstore.put("/safe.bin", io.BytesIO(crash_blob[:64 * 1024 * 1024]))
+    cstore.conn().close()
+
+
+    def crash_upload():
+        conn = http.client.HTTPConnection("127.0.0.1", CR_PORT, timeout=300)
+        try:
+            conn.request("PUT", "/victim.bin", body=io.BytesIO(crash_blob),
+                         headers={"Content-Length": str(len(crash_blob))})
+        except OSError:
+            pass                                   # server died mid-read: expected
+        finally:
+            conn.close()
+
+
+    th = threading.Thread(target=crash_upload); th.start()
+    time.sleep(3.5)                                 # get well into the transfer…
+    crash_srv.kill(); crash_srv.wait()
+    th.join()
+
+    crash_srv = spawn(                    # restart on same vault
+        [sys.executable, "-u", SMOL, cr_vault, "--serve",
+         "--host", "127.0.0.1", "--port", str(CR_PORT)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    end = time.time() + 15
+    while time.time() < end:
+        try:
+            cc = http.client.HTTPConnection("127.0.0.1", CR_PORT, timeout=1)
+            cc.request("OPTIONS", "/"); cc.getresponse().read(); cc.close()
+            break
+        except OSError:
+            time.sleep(0.2)
+
+    st_head = None
+    cc = http.client.HTTPConnection("127.0.0.1", CR_PORT, timeout=60)
+    cc.request("GET", "/safe.bin")
+    r_ = cc.getresponse()
+    back = r_.read(); cc.close()
+    rec("crash", "pre-crash file byte-exact after restart",
+        f"{r_.status} · {mb(len(back)):.0f} MB · "
+        f"sha={'OK' if hashlib.sha256(back).hexdigest() == pre_hash else 'BAD'}")
+
+    def _head_probe(path):
+        c3 = http.client.HTTPConnection("127.0.0.1", CR_PORT, timeout=10)
+        c3.request("GET", path)
+        rr = c3.getresponse(); rr.read(); stt = rr.status; c3.close()
+        return stt
+
+    rec("crash", "half-written victim not visible", f"GET /victim.bin → {_head_probe('/victim.bin')} (expect 404)")
+
+    p = subprocess.run([sys.executable, SMOL, cr_vault, "--gc"],
+                       capture_output=True, text=True)
+    gc_lines = [l for l in p.stdout.splitlines() if "gc:" in l]
+    # a kill -9 mid-ingest leaves the ingest lease behind, so the first gc line
+    # is the lease reclaim and the orphan count is the one after it
+    lease_line = [l for l in gc_lines if "lease" in l]
+    orphan_line = [l for l in gc_lines if "lease" not in l]
+    if lease_line:
+        rec("crash", "gc reclaims the dead ingest's lease",
+            lease_line[0].split("gc:")[-1].strip())
+    rec("crash", "--gc reclaims orphaned chunks",
+        orphan_line[0].split("gc:")[-1].strip() if orphan_line else "(none found)")
+
+    p = subprocess.run([sys.executable, SMOL, cr_vault, "--check"],
+                       capture_output=True, text=True)
+    tail = [l for l in p.stdout.splitlines() if "chunks checked" in l]
+    rec("crash", "--check after recovery",
+        f"{'PASS' if p.returncode == 0 else 'FAIL'} · "
+        f"{tail[0].strip().split('  ', 1)[1] if tail else '?'}")
+    crash_srv.terminate()
+
+    hr("STORM · three simultaneous mpv viewers + seek noise")
+    sample_path = os.path.join(W, "sample.mp4")
+    shutil_ok = __import__("shutil").which("mpv")
+    if os.path.exists(sample_path) and shutil_ok:
+        STORM_PORT = free_port(PORT + 6)
+        storm_srv = spawn(
+            [sys.executable, "-u", SMOL, VAULT, "--serve",
+             "--host", "127.0.0.1", "--port", str(STORM_PORT)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        end = time.time() + 15
+        while time.time() < end:
             try:
-                c4.request("GET", "/media/sample.mp4",
-                           headers={"Range": f"bytes={off}-{off+262143}"})
-                r5 = c4.getresponse()
-                assert r5.status == 206 and len(r5.read()) >= 1
-            except (OSError, AssertionError):
+                cc = http.client.HTTPConnection("127.0.0.1", STORM_PORT, timeout=1)
+                cc.request("OPTIONS", "/"); cc.getresponse().read(); cc.close()
                 break
-            noise_lat.append((time.perf_counter() - ts) * 1000)
-        c4.close()
+            except OSError:
+                time.sleep(0.2)
+        storm_url = f"http://127.0.0.1:{STORM_PORT}/media/sample.mp4"
+        noise_stop = [False]
+        noise_lat = []
 
-    tn = threading.Thread(target=noise); tn.start()
-    procs = [subprocess.Popen(["mpv", "--really-quiet", "--vo=null",
-                               "--ao=null", "--frames=240", storm_url],
-                              stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL) for _ in range(3)]
-    t0 = time.perf_counter()
-    for pr in procs:
-        pr.wait(timeout=180)
-    wall = time.perf_counter() - t0
-    noise_stop[0] = True; tn.join()
-    storm_srv.terminate()
-    noise_lat.sort()
-    rec("storm", "3 concurrent 720p decodes from one vault",
-        f"240 frames each in {wall:.1f}s wall "
-        f"(≈{3 * 240 / wall:.0f} fps aggregate)")
-    if noise_lat:
-        rec("storm", "seek-noise thread during storm",
-            f"{len(noise_lat)} reads · p50 {noise_lat[len(noise_lat)//2]:.1f} ms")
-else:
-    rec("storm", "skipped", "needs sample.mp4 (ffmpeg) + mpv")
+        def noise():
+            c4 = http.client.HTTPConnection("127.0.0.1", STORM_PORT, timeout=30)
+            rnd = random.Random(99)
+            while not noise_stop[0]:
+                off = rnd.randrange(0, max(1, os.path.getsize(sample_path) - 262144))
+                ts = time.perf_counter()
+                try:
+                    c4.request("GET", "/media/sample.mp4",
+                               headers={"Range": f"bytes={off}-{off+262143}"})
+                    r5 = c4.getresponse()
+                    assert r5.status == 206 and len(r5.read()) >= 1
+                except (OSError, AssertionError):
+                    break
+                noise_lat.append((time.perf_counter() - ts) * 1000)
+            c4.close()
 
-hr("WAL SOAK · sustained writes, commit-latency drift + WAL growth")
-soak_vault = os.path.join(W, "soak.vault")
-soak = sv.Store(soak_vault)
-blob = os.urandom(32 * 1024 * 1024)
-durs, wal_max, i = [], 0, 0
-t_end = time.perf_counter() + 45
-while time.perf_counter() < t_end:
-    ts = time.perf_counter()
-    soak.put(f"/soak/{i:04}.bin", io.BytesIO(blob))
-    durs.append(time.perf_counter() - ts)
-    wal = os.path.getsize(soak_vault + "-wal")
-    wal_max = max(wal_max, wal)
-    i += 1
-half = len(durs) // 2
-first, last = sorted(durs[:half]), sorted(durs[half:])
-gb = i * 32 / 1024
-mbps_mean = (i * 32) / sum(durs)                # blob is exactly 32 MB
-rec("soak", f"{i} × 32 MB continuous ({gb:.1f} GB in 45 s)",
-    f"{mbps_mean:.1f} MB/s mean")
-rec("soak", "commit latency drift (first half → second half)",
-    f"p50 {first[len(first)//2]*1000:.0f}→{last[len(last)//2]*1000:.0f} ms · "
-    f"p95 {first[int(len(first)*.95)]*1000:.0f}→{last[int(len(last)*.95)]*1000:.0f} ms")
-rec("soak", "peak WAL size", f"{mb(wal_max):.1f} MB (auto-checkpoint working)"
-    if wal_max < 512 * 1024 * 1024 else f"{mb(wal_max):.1f} MB — CHECK GROWTH")
+        tn = threading.Thread(target=noise); tn.start()
+        procs = [spawn(["mpv", "--really-quiet", "--vo=null",
+                                   "--ao=null", "--frames=240", storm_url],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL) for _ in range(3)]
+        t0 = time.perf_counter()
+        for pr in procs:
+            pr.wait(timeout=180)
+        wall = time.perf_counter() - t0
+        noise_stop[0] = True; tn.join()
+        storm_srv.terminate()
+        noise_lat.sort()
+        rec("storm", "3 concurrent 720p decodes from one vault",
+            f"240 frames each in {wall:.1f}s wall "
+            f"(≈{3 * 240 / wall:.0f} fps aggregate)")
+        if noise_lat:
+            rec("storm", "seek-noise thread during storm",
+                f"{len(noise_lat)} reads · p50 {noise_lat[len(noise_lat)//2]:.1f} ms")
+    else:
+        rec("storm", "skipped", "needs sample.mp4 (ffmpeg) + mpv")
+
+    hr("WAL SOAK · sustained writes, commit-latency drift + WAL growth")
+    soak_vault = os.path.join(W, "soak.vault")
+    soak = sv.Store(soak_vault)
+    blob = os.urandom(32 * 1024 * 1024)
+    durs, wal_max, i = [], 0, 0
+    t_end = time.perf_counter() + 45
+    while time.perf_counter() < t_end:
+        ts = time.perf_counter()
+        soak.put(f"/soak/{i:04}.bin", io.BytesIO(blob))
+        durs.append(time.perf_counter() - ts)
+        wal = os.path.getsize(soak_vault + "-wal")
+        wal_max = max(wal_max, wal)
+        i += 1
+    half = len(durs) // 2
+    first, last = sorted(durs[:half]), sorted(durs[half:])
+    gb = i * 32 / 1024
+    mbps_mean = (i * 32) / sum(durs)                # blob is exactly 32 MB
+    rec("soak", f"{i} × 32 MB continuous ({gb:.1f} GB in 45 s)",
+        f"{mbps_mean:.1f} MB/s mean")
+    rec("soak", "commit latency drift (first half → second half)",
+        f"p50 {first[len(first)//2]*1000:.0f}→{last[len(last)//2]*1000:.0f} ms · "
+        f"p95 {first[int(len(first)*.95)]*1000:.0f}→{last[int(len(last)*.95)]*1000:.0f} ms")
+    rec("soak", "peak WAL size", f"{mb(wal_max):.1f} MB (auto-checkpoint working)"
+        if wal_max < 512 * 1024 * 1024 else f"{mb(wal_max):.1f} MB — CHECK GROWTH")
+
 
 # ---------------------------------------------------------------- output
 hr("SUMMARY")
@@ -1114,7 +1167,7 @@ Generated by `benchmark.py` on {time.strftime('%Y-%m-%d %H:%M')}
 ({'quick' if QUICK else 'full'} run).
 
 Environment: Python {sys.version.split()[0]} · {os.cpu_count()} cores ·
-NVMe SSD · loopback HTTP/1.1.
+loopback HTTP/1.1 (datasets are in-memory/page-cached, not cold NVMe).
 
 """ + "\n".join(lines) + "\n"
 
@@ -1126,4 +1179,5 @@ else:
         f.write(md)
     print(f"\nsaved -> {out_md}")
 
-subprocess.run(["rm", "-rf", W])
+# Scratch cleanup now lives in the atexit handler, so a SIGTERM/timeout
+# removes the multi-GB vault just as a normal completion does.

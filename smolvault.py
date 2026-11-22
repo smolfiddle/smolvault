@@ -43,10 +43,12 @@ Highlights
 Cross-process safety
 --------------------
 A write lock only orders threads inside one process, so an ingest
-publishes a lease row (`ingest_lease`) before its first chunk lands.
-`--gc` in another terminal sees that lease and defers collection instead
-of deleting chunks the running seal still owns; leases older than
-LEASE_GRACE are reclaimed, so a `kill -9` mid-ingest self-heals. A
+publishes a lease row (`ingest_lease`) with its first chunk batch and
+refreshes its timestamp on every subsequent batch, so a long seal cannot
+age out of its own protection. `--gc` in another terminal sees that lease
+and defers collection instead of deleting chunks the running seal still
+owns; a lease whose owner is gone, or that has stopped heartbeating for
+LEASE_GRACE, is reclaimed — so a `kill -9` mid-ingest self-heals. A
 truncated or hash-mismatched ingest is rolled back with `Store.drop_file`,
 which reclaims the chunks too rather than orphaning them into `stats()`.
 
@@ -64,6 +66,7 @@ import glob
 import hashlib
 import html
 import hmac
+import http.client
 import http.server
 import json
 import logging
@@ -85,7 +88,7 @@ import zlib
 from collections import Counter, namedtuple
 from socketserver import ThreadingMixIn
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 log = logging.getLogger("smolvault")
 
@@ -187,10 +190,20 @@ class Chunker:
         self.mask_l = 0x7FFFF
 
     def chunk(self, fobj):
+        """Yield content-defined chunks. The scan is split into two phases
+        (short-window mask, then long-window mask) so the per-sample
+        ``off = cur - pos`` subtraction and branch disappear from the hot
+        loop. The rolling hash *h* is carried across the phase boundary,
+        so every cut position is byte-for-byte identical to the original
+        single-loop version — chunk boundaries, dedup and on-disk format
+        are unchanged. Interleaved A/B measured ~1.5x faster at stride 64
+        (the media path) and ~1.1x at stride 32 (compressible text).
+        """
         gear, stride = self.gear, self.stride
         min_s, max_s = self.min_s, self.max_s
         mask_s, mask_l = self.mask_s, self.mask_l
         buf, pos, read = bytearray(), 0, fobj.read
+        mask64 = 0xFFFFFFFFFFFFFFFF
 
         while True:
             if len(buf) - pos < max_s + stride:
@@ -207,19 +220,23 @@ class Chunker:
                 continue
 
             cut, h, cur = -1, 0, pos + min_s
-            while cur < n:
-                h = ((h << 1) + gear[buf[cur]]) & 0xFFFFFFFFFFFFFFFF
-                off = cur - pos
-                if off < 262144:
-                    if (h & mask_s) == 0:
-                        cut = cur
-                        break
-                elif (h & mask_l) == 0:
+            phase1_end = pos + 262144
+            # phase 1: dense mask, first 256 KiB of the chunk
+            while cur < n and cur < phase1_end:
+                h = ((h << 1) + gear[buf[cur]]) & mask64
+                if not (h & mask_s):
+                    cut = cur
+                    break
+                cur += stride
+            # phase 2: sparse mask, same rolling hash h continued
+            while cut < 0 and cur < n:
+                h = ((h << 1) + gear[buf[cur]]) & mask64
+                if not (h & mask_l):
                     cut = cur
                     break
                 cur += stride
 
-            if cut != -1:
+            if cut >= 0:
                 yield bytes(buf[pos:cut + 1])
                 pos = cut + 1
             elif n - pos >= max_s:
@@ -324,9 +341,16 @@ def _parse_content_length(headers, max_len=None):
     if raw is None:
         return -1, 411  # missing
     raw = raw.strip()
-    if not raw.isdigit():          # rejects "bad", "-1" and "5_0" (int() would take the last)
+    # isdigit() accepts non-ASCII digits whose int() raises, and CPython
+    # refuses integers with more than 4300 digits — both used to kill the
+    # request thread with an uncaught ValueError. Keep it plain ASCII and
+    # bounded, and treat any parse failure as a normal 400.
+    if not raw or len(raw) > 20 or any(c < "0" or c > "9" for c in raw):
         return None, 400
-    v = int(raw)
+    try:
+        v = int(raw)
+    except ValueError:
+        return None, 400
     if v < 0:
         return None, 400
     if max_len is not None and v > max_len:
@@ -507,6 +531,12 @@ class Store:
         # so a stray access is a LockedVault, not an AttributeError
         self._mk = self._ek = self._nk = self._msg_k = None
         self._enc_on = None      # cached enc_enabled() flag
+        # Short-lived auth cache: PBKDF2 is ~50 ms, and a player issues one
+        # request per range. The cache key is an HMAC of the password under
+        # an in-memory secret, so no password-equivalent is stored on disk
+        # or in the cache itself.
+        self._auth_secret = os.urandom(32)
+        self._auth_cache = {}
         # An in-memory (or shared-cache URI) database is per-*connection*,
         # so the thread-local scheme would hand every request thread a
         # private, schema-less DB. Those are test-only: use one connection.
@@ -555,6 +585,21 @@ class Store:
         # point of a media server.
         c.execute("PRAGMA cache_size=-64000")
         c.execute("PRAGMA temp_store=MEMORY")
+        # WAL auto-checkpoint threshold (pages; 0 disables it entirely).
+        # SQLite's default of 1000 (~4 MB) forces a checkpoint in the
+        # middle of every large seal: an interleaved 64 MB A/B measured
+        # 69 MB/s at 1000 vs 105 MB/s at 100000. The trade-off is WAL
+        # size — it grows to roughly one file's worth before checkpoint.
+        # Opt in on machines with RAM to spare; the constrained-box
+        # profile keeps SQLite's small, safe default.
+        ckpt = os.environ.get("SMOLVAULT_WAL_CHECKPOINT")
+        if ckpt:
+            try:
+                n = int(ckpt)
+                if 0 <= n <= 2_147_483_647:
+                    c.execute(f"PRAGMA wal_autocheckpoint={n}")
+            except (ValueError, sqlite3.Error):
+                pass
         c.row_factory = sqlite3.Row
         return c
 
@@ -588,6 +633,9 @@ class Store:
         c.executemany("INSERT OR REPLACE INTO config VALUES (?,?)",
                       [("salt", salt.hex()), ("hash", phash.hex())])
         c.commit()
+        # A password change must invalidate every cached verification.
+        self._auth_secret = os.urandom(32)
+        self._auth_cache.clear()
 
     def has_password(self):
         return self.conn().execute(
@@ -602,6 +650,27 @@ class Store:
         calc = hashlib.pbkdf2_hmac("sha256", password.encode(),
                                    bytes.fromhex(d["salt"]), 100_000)
         return hmac.compare_digest(calc, bytes.fromhex(d["hash"]))
+
+    AUTH_CACHE_TTL = 60.0       # seconds; a player's range burst fits inside
+    AUTH_CACHE_MAX = 1024
+
+    def verify_password(self, password):
+        """check_password() with a short-lived, keyed cache. Raw PBKDF2 costs
+        ~50 ms per call, which dominated authenticated range requests. The
+        cache key is HMAC(in-memory-secret, password) — no password or
+        password-equivalent is ever persisted or kept in the cache.
+        """
+        key = hmac.new(self._auth_secret, password.encode(),
+                       hashlib.sha256).digest()
+        now = time.monotonic()
+        hit = self._auth_cache.get(key)
+        if hit is not None and hit[0] > now:
+            return hit[1]
+        ok = self.check_password(password)
+        if len(self._auth_cache) >= self.AUTH_CACHE_MAX:
+            self._auth_cache.clear()
+        self._auth_cache[key] = (now + self.AUTH_CACHE_TTL, ok)
+        return ok
 
     # ---- HTTP auth gate (decoupled from at-rest encryption) ----------------
 
@@ -716,6 +785,7 @@ class Store:
         total = c.execute("SELECT COUNT(*) FROM chunks WHERE "
                           + self._ENC_PRED).fetchone()[0]
         done = int(self.cfg_get("enc_cursor", 0) or 0)
+        rewritten = 0
         while True:
             # keyset pagination: one forward pass, not one pass per batch
             rows = c.execute(
@@ -727,9 +797,12 @@ class Store:
             c.execute("BEGIN TRANSACTION")
             try:
                 for rowid, h, data in rows:
+                    done = rowid
+                    if data.startswith(self.ENC_MAGIC):
+                        continue      # already sealed (a legacy collision)
                     c.execute("UPDATE chunks SET data=? WHERE hash=?",
                               (self._seal(data, h), h))
-                    done = rowid
+                    rewritten += 1
                 c.commit()
             except Exception:
                 c.rollback()
@@ -738,7 +811,7 @@ class Store:
             if progress:
                 progress(done, total)
         self.cfg_set("enc_cursor", 0)
-        return done
+        return rewritten
 
     def _kek(self, password, salt):
         return hashlib.scrypt(password.encode(), salt=salt, n=2 ** 15,
@@ -759,7 +832,15 @@ class Store:
                 "vault is encrypted — provide the password to unlock")
 
     def _seal(self, blob, h_hex):
-        if not self.enc_enabled() or blob.startswith(self.ENC_MAGIC):
+        """Encrypt unconditionally while the vault is encrypted.
+
+        The old `blob.startswith(ENC_MAGIC)` shortcut left a legitimate
+        plaintext chunk whose first five bytes were SVEN\\x01 unencrypted,
+        and it was then mistaken for an envelope on read — making the file
+        permanently unreadable. Only migrate_encryption() uses the magic
+        to skip rows it has already rewritten.
+        """
+        if not self.enc_enabled():
             return blob
         self._require_keys()
         nonce = hashlib.blake2b(bytes.fromhex(h_hex), key=self._nk,
@@ -769,16 +850,25 @@ class Store:
         return self.ENC_MAGIC + nonce + ct + tag
 
     def _open(self, data, h_hex):
-        """Inverse of _seal. Legacy plaintext blobs pass through untouched
-        (magic sniffing keeps mid-migration states fully readable)."""
-        if not data.startswith(self.ENC_MAGIC):
+        """Inverse of _seal. Plaintext blobs pass through untouched.
+
+        A legacy chunk written before the collision fix can start with the
+        magic yet be plaintext. If AEAD authentication fails, verify the
+        stored bytes against the chunk hash: a match means plaintext, not
+        a tampered envelope.
+        """
+        if not data.startswith(self.ENC_MAGIC) or not self.enc_enabled():
             return data
         self._require_keys()
         nonce = data[5:17]
         ct = data[17:-16]
-        pt = _Crypto.open(self._ek, nonce, ct + data[-16:],
-                          aad=self.ENC_MAGIC + bytes.fromhex(h_hex))
-        return pt
+        try:
+            return _Crypto.open(self._ek, nonce, ct + data[-16:],
+                                aad=self.ENC_MAGIC + bytes.fromhex(h_hex))
+        except ValueError:
+            if hashlib.blake2b(data, digest_size=32).hexdigest() == h_hex:
+                return data
+            raise
 
     def _seal_msg(self, body):
         data = body.encode() if isinstance(body, str) else body
@@ -791,12 +881,44 @@ class Store:
         return "SVMSG:" + base64.b64encode(env_nonce + ct + tag).decode()
 
     def _open_msg(self, stored):
-        if not stored.startswith("SVMSG:"):
+        # An unencrypted vault can hold a perfectly ordinary note that
+        # begins with "SVMSG:" — never try to decode it as an envelope
+        # unless this vault actually uses encryption.
+        if not stored.startswith("SVMSG:") or not self.enc_enabled():
             return stored
         import base64
         raw = base64.b64decode(stored[6:])
         pt = _Crypto.open(self._msg_k, raw[:12], raw[12:], aad=b"sv-msg")
         return pt.decode()
+
+    def migrate_messages(self, encrypt):
+        """Seal (or unseal) board messages alongside a chunk migration.
+
+        --encrypt/--decrypt used to touch only `chunks`, so messages were
+        left plaintext at rest and, worse, --decrypt dropped the key while
+        SVMSG envelopes were still present — destroying the whole board.
+        Returns the number of rows rewritten (idempotent).
+        """
+        if not self.enc_enabled():
+            return 0
+        self._require_keys()
+        c = self.conn()
+        if encrypt:
+            rows = c.execute(
+                "SELECT id, body FROM messages "
+                "WHERE body NOT LIKE 'SVMSG:%'").fetchall()
+            convert = self._seal_msg
+        else:
+            rows = c.execute(
+                "SELECT id, body FROM messages "
+                "WHERE body LIKE 'SVMSG:%'").fetchall()
+            convert = self._open_msg
+        for mid, body in rows:
+            c.execute("UPDATE messages SET body=? WHERE id=?",
+                      (convert(body), mid))
+        if rows:
+            c.commit()
+        return len(rows)
 
     # ---- stats -------------------------------------------------------------
 
@@ -868,10 +990,12 @@ class Store:
         instead of deferring a multi-GB commit). Per-row rowcount yields
         exact new-byte accounting with no lookup queries at all.
 
-        *lease* rides along in the **first** batch's transaction, so the
-        ingest lease becomes visible to a concurrent --gc at exactly the
-        instant the chunks it protects do. Atomic cross-table visibility
-        means gc can never see protected chunks without the lease.
+        *lease* rides along in **every** batch's transaction: the first
+        batch makes the lease visible to a concurrent --gc at exactly the
+        instant the chunks it protects do (atomic cross-table visibility),
+        and later batches refresh its timestamp as a heartbeat. Without a
+        heartbeat, `gc`'s age-based reclaim could delete the chunks of a
+        live ingest that had been running longer than LEASE_GRACE.
 
         Committing the lease separately instead measured -21% on 1500
         small files (768 -> 606 files/s, 6 rotated passes) because it made
@@ -914,6 +1038,11 @@ class Store:
             raise ExistsError(path)
         try:
             return self._put_locked(c, path, reader, progress)
+        except ExistsError:
+            # A WORM race was already cleaned up inside _put_locked, which
+            # must not touch the winning row. Falling through to _drop_file
+            # here used to delete the winner's file after an instant 409.
+            raise
         except BaseException:
             # A put that dies mid-stream may have committed some batches (and
             # with them the lease). Clear it here rather than relying on the
@@ -943,7 +1072,6 @@ class Store:
         # first batch's transaction rather than committed separately: atomic
         # cross-table visibility means gc can never see protected chunks
         # without the lease, and it costs no extra commit.
-        leased = False
         hashes, sizes, offsets = [], [], []
         off = 0
         batch = {}                            # hash -> (stored, comp), ordered
@@ -977,13 +1105,10 @@ class Store:
             sizes.append(len(raw))
             off += len(raw)
             if len(batch) >= self.DB_BATCH:
-                # the lease rides along with the very first batch
-                self._flush_chunks(c, batch, new_stored,
-                                   lease=path if not leased else None)
-                leased = True
+                # the lease rides in every batch; later ones are heartbeats
+                self._flush_chunks(c, batch, new_stored, lease=path)
                 batch = {}
-        self._flush_chunks(c, batch, new_stored,
-                           lease=path if not leased else None)
+        self._flush_chunks(c, batch, new_stored, lease=path)
 
         root = hashlib.blake2b("".join(hashes).encode(),
                                digest_size=32).hexdigest()
@@ -1001,7 +1126,22 @@ class Store:
             c.commit()
         except sqlite3.IntegrityError:
             c.rollback()
-            self._drop_file(path)     # lost a WORM race: don't leak our chunks
+            # Another writer won this path. Never delete a row we did not
+            # insert: _drop_file() would remove the winner's committed file
+            # and its chunks. Reclaim only chunks from our own manifest that
+            # no surviving file references, and clear our lease.
+            live = set()
+            for (manifest,) in c.execute("SELECT manifest FROM files"):
+                try:
+                    live.update(json.loads(manifest)["chunks"])
+                except (ValueError, TypeError, KeyError):
+                    pass
+            ours = set(hashes) - live
+            if ours:
+                c.executemany("DELETE FROM chunks WHERE hash=?",
+                              [(h,) for h in ours])
+            self._clear_lease(c, path)
+            c.commit()
             raise ExistsError(path)
         return PutResult(off, root, new_stored[0], len(hashes))
 
@@ -1183,7 +1323,8 @@ class Store:
             now = time.time()
             # A crashed ingest leaves its lease behind. Two ways to tell:
             # the owning pid is gone (the usual case, and immediate), or the
-            # lease is simply too old to trust (covers pid reuse).
+            # lease timestamp is stale (a live writer refreshes it on every
+            # batch, so this also covers pid reuse).
             stale = [r[0] for r in c.execute("SELECT path, started, pid "
                                              "FROM ingest_lease")
                      if not self._pid_alive(r[2])
@@ -1488,7 +1629,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if kind.lower() != "basic":
                 raise ValueError
             _, pw = __import__("base64").b64decode(blob).decode().split(":", 1)
-            if self.store.check_password(pw):
+            if self.store.verify_password(pw):
                 return True
         except Exception:
             pass
@@ -1632,9 +1773,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if_rng = self.headers.get("If-Range")
         if_rng_ok = True
         if if_rng:
-            # a weak or date-valued If-Range that doesn't match means
-            # "ignore the Range and send the whole thing"
-            if_rng_ok = (_etag_canon(if_rng) == etag)
+            # RFC 7233 §3.2 requires the strong comparison function for
+            # If-Range, so a weak validator (W/"...") must be ignored —
+            # otherwise a player could recombine bytes from two different
+            # representations. If-None-Match still allows weak comparison.
+            if_rng_ok = (if_rng.strip().startswith('"')
+                         and _etag_canon(if_rng) == etag)
         if rng_hdr and if_rng_ok:
             try:
                 rng = parse_range(rng_hdr, row["size"])
@@ -1725,7 +1869,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         rel = q.get("dir", [""])[0]
         want_files = q.get("recursive", ["0"])[0] == "1"
-        target = os.path.realpath(os.path.join(sr, rel.lstrip("/")))
+        if "\x00" in rel:
+            return self._fail(400, b"bad dir\n")
+        try:
+            target = os.path.realpath(os.path.join(sr, rel.lstrip("/")))
+        except (ValueError, OSError):
+            return self._fail(400, b"bad dir\n")
         if not self._contained(sr, target):
             return self._fail(403, b"path escapes share root\n")
         truncated = False
@@ -1733,7 +1882,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             files = []
             for dp, dns, fns in os.walk(target):
                 dns[:] = [x for x in dns
-                          if not x.startswith(".") and x != "__pycache__"]
+                          if not x.startswith(".") and x != "__pycache__"
+                          and not os.path.islink(os.path.join(dp, x))]
                 for fn in fns:
                     if fn.startswith("."):
                         continue
@@ -1744,6 +1894,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         dns[:] = []
                         break
                     p = os.path.join(dp, fn)
+                    # Never expose a symlink's target name/size: that leaks
+                    # metadata about files outside the share root, and the
+                    # ingest side would reject them anyway.
+                    if os.path.islink(p):
+                        continue
+                    if not self._contained(sr, os.path.realpath(p)):
+                        continue
                     if os.path.isfile(p):
                         files.append({
                             "path": os.path.relpath(p, sr).replace(os.sep, "/"),
@@ -1752,8 +1909,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload = json.dumps({"files": files,
                                   "truncated": truncated}).encode()
         else:
-            entries = [{"name": n, "is_dir": is_d, "size": s}
-                       for n, is_d, s in scan_dir(target)]
+            entries = []
+            for n, is_d, s in scan_dir(target):
+                full = os.path.join(target, n)
+                if os.path.islink(full):
+                    continue
+                if not self._contained(sr, os.path.realpath(full)):
+                    continue
+                entries.append({"name": n, "is_dir": is_d, "size": s})
             rel_norm = os.path.relpath(target, sr).replace(os.sep, "/")
             payload = json.dumps({"dir": "" if rel_norm == "." else rel_norm,
                                   "entries": entries}).encode()
@@ -1767,7 +1930,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         files under --share-root into this vault (additive WORM)."""
         sr = self._share_root()
         if not sr:
-            return self._fail(403, b"share root not enabled on this vault\n")
+            # The body has not been read yet. With keep-alive it would be
+            # parsed as the next request — the classic smuggling primitive.
+            return self._fail(403, b"share root not enabled on this vault\n",
+                              close=True)
         length, err = _parse_content_length(self.headers, max_len=262144)
         if err or length <= 0:
             return self._fail(400, b"bad or missing Content-Length\n",
@@ -1784,6 +1950,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     400, f"too many paths (max {MAX_INGEST_PATHS})")
             rels = [str(p) for p in raw_paths]
             into = str(req.get("into", "/")) or "/"
+            if any("\x00" in p for p in rels) or "\x00" in into:
+                raise ValueError("NUL byte in path")
         except (ValueError, json.JSONDecodeError) as e:
             return self._fail(400, f"bad ingest request: {e}\n".encode(),
                               close=True)
@@ -1831,7 +1999,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         jobs = []
         seen_files = set()
         for rel in rels:
-            target = os.path.realpath(os.path.join(sr, rel.lstrip("/")))
+            try:
+                target = os.path.realpath(os.path.join(sr, rel.lstrip("/")))
+            except (ValueError, OSError):
+                results.append({"path": rel, "status": 400})
+                continue
             if not contained(target):
                 results.append({"path": rel, "status": 403})
                 continue
@@ -2586,17 +2758,19 @@ def _clipboard_set(text):
         return False
 
 
-def _copy_or_show(url):
+def _copy_or_show(url, display=None):
     """On launch failure: get the URL into the user's player with the
-    least friction available."""
+    least friction available. *display* may be a redacted copy for printing;
+    the clipboard always gets the real (credential-bearing) URL."""
+    shown = display or url
     if _clipboard_set(url):
         print(green("  ✓ stream link COPIED — open mpv/VLC → paste → play"))
     else:
-        print(dim(f"  manual: open your player → 'Open URL' → {url}"))
+        print(dim(f"  manual: open your player → 'Open URL' → {shown}"))
     return EXIT_NOMATCH
 
 
-def _termux_video_launch(url, mime, want_mpv_app):
+def _termux_video_launch(url, mime, want_mpv_app, display=None):
     """Send *url* to Android video apps over an intent — the same
     MPVActivity recipe ani-cli uses on Termux.
 
@@ -2605,7 +2779,9 @@ def _termux_video_launch(url, mime, want_mpv_app):
                    kills raw /system/bin/am, hence termux-am first.
       system am  → still works on Android <= 13 on many devices.
     Falls back to `termux-open` (pure app-framework intent) at the end.
-    Returns exit code."""
+    Returns exit code. *display* is a redacted URL for all printing — the
+    real URL is only ever passed to the intent/clipboard."""
+    shown = display or url
     intents = [["-n", TERMUX_MPV_APP, "-e", "filepath", url]]
     if not want_mpv_app:
         intents.append(["-a", "android.intent.action.VIEW",
@@ -2628,7 +2804,7 @@ def _termux_video_launch(url, mime, want_mpv_app):
             if runner in dead_runners:
                 continue
             print(dim(f"  ▶ android ({runner}) → {target}"))
-            print(dim(f"     {url}"))
+            print(dim(f"     {shown}"))
             p = subprocess.run([runner, "start"] + argv,
                                capture_output=True, text=True)
             out = ((p.stderr or "") + (p.stdout or "")).strip()
@@ -2672,13 +2848,20 @@ def _termux_video_launch(url, mime, want_mpv_app):
         print(red(f"  ✗ could not launch player ({last_out[:100]}) — {hint}"))
     else:
         print(red(f"  ✗ could not launch player — {hint}"))
-    return _copy_or_show(url)
+    return _copy_or_show(url, shown)
 
 
 def play_url(url, mime=None, player=None):
     """Launch *url* in a player. On Termux, video is routed to Android's
     own apps (mpv-android first) because CLI mpv there has no video
     output. Returns process exit code semantics (0 = fine)."""
+    # redact password in every printed form of the URL (S-02). The real
+    # URL still goes to the player / intent / clipboard verbatim.
+    try:
+        _parsed = urllib.parse.urlparse(url)
+        _safe = url.replace(_parsed.password or "", "***") if _parsed.password else url
+    except Exception:
+        _safe = url
     env_player = os.environ.get("SMOLVAULT_PLAYER")
     explicit = bool(env_player) or bool(player)
     chosen = (player or env_player or "").lower()
@@ -2690,7 +2873,7 @@ def play_url(url, mime=None, player=None):
     if (_in_termux() and not os.environ.get("DISPLAY")
             and mime and mime.startswith("video/")):
         if not explicit or want_app or is_default_mpv:
-            return _termux_video_launch(url, mime, want_mpv_app=want_app)
+            return _termux_video_launch(url, mime, want_app, display=_safe)
         # a genuinely different binary player was requested — below
 
     if not player and env_player and not want_app:
@@ -2700,12 +2883,6 @@ def play_url(url, mime=None, player=None):
     if shutil.which(player) is None:
         print(red(f"  ✗ player '{player}' not found"))
         return EXIT_NOMATCH
-    # redact password in log (S-02)
-    try:
-        _parsed = urllib.parse.urlparse(url)
-        _safe = url.replace(_parsed.password or "", "***") if _parsed.password else url
-    except Exception:
-        _safe = url
     print(dim(f"  ▶ {player} {_safe}"))
     try:
         return subprocess.run([player, url]).returncode
@@ -3740,7 +3917,7 @@ def _board_render(view, buffer_text, anchor_label, error=None):
                               + dim(f"[{ts}]  ") + r["body"]))
     lines.append(line(""))
     lines.append(line(f"  {cyan('post ❯')} {buffer_text}█   "
-                      + dim("(enter=send · esc/q=back)")))
+                      + dim("(enter=send · esc=back)")))
     return "\n".join(lines) + f"\r\x1b[{len(lines)}A"
 
 
@@ -3755,7 +3932,7 @@ def _tty_ok():
 def board_live(store=None, fetch=None, send=None, read_key=None,
                poll=1.5, label="board", assume_tty=False):
     """Real-time board (TTY): messages stream in via a poll loop while
-    you type; Enter posts the line buffer, Esc/q exits. Falls back to
+    you type; Enter posts the line buffer, Esc exits. Falls back to
     board_prompt() when stdin isn't a real terminal. Tests inject
     read_key (a zero-arg callable) and skip the select gate."""
     interactive = read_key is None
@@ -3855,8 +4032,8 @@ def board_live(store=None, fetch=None, send=None, read_key=None,
                         buf = ""
                 drain_and_render()
                 continue
-            if key == "q":                    # documented exit, not a post
-                break
+            # 'q' is an ordinary letter now: every character can reach the
+            # message buffer. Esc (and Ctrl+C/D above) are the exits.
             if key == "\x7f":
                 buf = buf[:-1]
             elif len(key) == 1 and key >= " ":
@@ -4019,11 +4196,13 @@ def show_info(store, arg):
     man = json.loads(row["manifest"])
     chunks = len(man["chunks"])
     avg = row["size"] / chunks if chunks else 0
+    sizes = man["sizes"]
+    span = f", {fmt(min(sizes))}–{fmt(max(sizes))}" if sizes else ""
     print(f"""  {bold(path)}
     size     : {fmt(row['size'])}
     type     : {row['mime']}
     sealed   : {row['created_at']}
-    chunks   : {chunks}  (avg {fmt(avg)}, {fmt(min(man['sizes']))}–{fmt(max(man['sizes']))})
+    chunks   : {chunks}  (avg {fmt(avg)}{span})
     etag     : {row['root_hash'][:24]}…
     policy   : WORM — this file can never be changed or deleted""")
     if sys.stdin.isatty():
@@ -4184,7 +4363,7 @@ class Wizard:
         if not self.no_discover:
             name = os.path.basename(self.vault).replace(".vault", "")
             self.discovery = DiscoveryResponder(
-                name, port, self.store.has_password(),
+                name, port, self.store.auth_required(),
                 files=self.store.stats()["files"])
             self.discovery.start()
         self.store.cfg_set("lan_port", port)          # stable URL next run
@@ -4339,6 +4518,9 @@ class Wizard:
             if not picked:
                 return
             out = self.ask(dim("  save as? [default: same name]") + " ").strip()
+            if len(picked) > 1 and out:
+                print(dim("  (multiple files — each keeps its own name)"))
+                out = ""          # one name cannot address several exports
             for path, _row in picked:
                 export_file(self.store, path,
                             out or os.path.basename(path))
@@ -4950,24 +5132,66 @@ def discover_vaults(timeout=2.0):
         try:
             data, addr = s.recvfrom(2048)
             info = json.loads(data)
-            if info.get("proto") == "smolvault":
-                key = (addr[0], info["http_port"])
-                found[key] = info
+            # Any LAN host can unicast to the discovery port. Validate the
+            # shape before indexing it — malformed replies used to raise
+            # KeyError/AttributeError out of --connect and sync.
+            if not isinstance(info, dict) or info.get("proto") != "smolvault":
+                continue
+            hp = info.get("http_port")
+            if not isinstance(hp, int) or not 1 <= hp <= 65535:
+                continue
+            info.setdefault("name", "vault")
+            info.setdefault("auth", False)
+            info.setdefault("files", None)
+            key = (addr[0], hp)
+            found[key] = info
         except (socket.timeout, OSError, ValueError):
             pass
     s.close()
     return [(host, port, info) for (host, port), info in sorted(found.items())]
 
 
+def parse_target(spec):
+    """Parse HOST[:PORT] (bracketed IPv6 allowed) into (host, port)."""
+    s = str(spec).strip()
+    if s.startswith("["):
+        host, sep, rest = s[1:].partition("]")
+        if not sep:
+            raise ValueError(f"bad target {spec!r}: unclosed IPv6 bracket")
+        port = rest.lstrip(":") or "8100"
+    else:
+        if s.count(":") > 1:
+            raise ValueError(f"bad target {spec!r}: use [host]:port for IPv6")
+        host, _, port = s.partition(":")
+        port = port or "8100"
+    if not host:
+        raise ValueError(f"bad target {spec!r}: missing host")
+    try:
+        p = int(port)
+    except ValueError:
+        raise ValueError(f"bad target {spec!r}: port must be a number") from None
+    if not 1 <= p <= 65535:
+        raise ValueError(f"bad target {spec!r}: port out of range 1-65535")
+    return host, p
+
+
 def resolve_target(spec):
     """--connect value -> (host, port). 'auto' triggers discovery."""
     if spec and spec != "auto":
-        host, _, port = spec.partition(":")
-        return [(host, int(port or 8100), None)]
+        try:
+            host, port = parse_target(spec)
+        except ValueError as e:
+            print(red(f"  ✗ {e}"))
+            return []
+        return [(host, port, None)]
     env = os.environ.get("SMOLVAULT_SERVER")
     if env:
-        host, _, port = env.partition(":")
-        return [(host, int(port or 8100), None)]
+        try:
+            host, port = parse_target(env)
+        except ValueError as e:
+            print(red(f"  ✗ {e}"))
+            return []
+        return [(host, port, None)]
     print(dim("  searching LAN for smolvaults…"))
     hits = discover_vaults()
     if not hits:
@@ -5149,7 +5373,10 @@ def sync_vault(store, direction, host, port, assume_yes=False):
             bar.finish()
             skipped += 1
             print(yellow(f"  = already sealed: {path}"))
-        except (RemoteError, OSError, ValueError) as e:
+        except (RemoteError, OSError, ValueError,
+                http.client.HTTPException) as e:
+            # IncompleteRead is an HTTPException, not an OSError — a peer
+            # that dies mid-transfer used to escape as a raw traceback.
             bar.finish()
             failed += 1
             print(red(f"  ✗ {path}: {e}"))
@@ -5301,6 +5528,9 @@ def run_client(spec, player=None):
                             continue
                         out = input(dim("  save as? [default: same name]")
                                     + " ").strip() or None
+                        if len(picked) > 1 and out:
+                            print(dim("  (multiple files — each keeps its own name)"))
+                            out = None
                         for vp, _row in picked:
                             rv.export(vp, out)
                         continue
@@ -5613,24 +5843,28 @@ def main(argv=None):
         def ask_pw(prompt):
             return args.password or getpass.getpass(dim(prompt)).strip()
 
+        # Keep the prompted password: passing args.password here used to
+        # hand "" to disable_encryption() on a piped --decrypt, crashing
+        # *after* every chunk had been rewritten.
+        pw = args.password
         try:
             if args.encrypt:
                 if store.has_password():
-                    cur = ask_pw("current password: ")
-                    if not store.check_password(cur):
+                    pw = ask_pw("current password: ")
+                    if not store.check_password(pw):
                         print(red("incorrect password"))
                         return EXIT_NOMATCH
                 else:
                     if not sys.stdin.isatty() and not args.password:
                         ap.error("--encrypt needs -p/--password or a terminal")
-                    cur = ask_pw("set vault password: ")
+                    pw = ask_pw("set vault password: ")
                     pw2 = (args.password if args.password else
                            getpass.getpass(dim("confirm: ")).strip())
-                    if not cur or cur != pw2:
+                    if not pw or pw != pw2:
                         print(red("passwords empty or mismatch"))
                         return EXIT_NOMATCH
-                    store.set_password(cur)
-                store.enable_encryption(cur)
+                    store.set_password(pw)
+                store.enable_encryption(pw)
             else:
                 pw = ask_pw("vault password: ")
                 store.unlock(pw)
@@ -5641,11 +5875,12 @@ def main(argv=None):
             print(red(str(e)))
             return EXIT_NOMATCH
 
+        # Same fast predicate the Store uses — substr(hex(data),1,10)
+        # materialised a 2x-blob string for every row.
+        pred = store._ENC_PRED if args.encrypt else \
+            "hex(substr(data,1,5))='5356454E01'"
         n_all = store.conn().execute(
-            "SELECT COUNT(*) FROM chunks WHERE "
-            "substr(hex(data),1,10) "
-            f"{'<>' if args.encrypt else '='} '5356454E01'"
-        ).fetchone()[0]
+            f"SELECT COUNT(*) FROM chunks WHERE {pred}").fetchone()[0]
         bar = ProgressBar("chunks", max(n_all, 1))
 
         def prog(done, total):
@@ -5653,30 +5888,47 @@ def main(argv=None):
 
         try:
             if args.decrypt:
+                # Batched keyset pagination: the old fetchall() pulled every
+                # encrypted blob into RAM at once (an OOM on real media
+                # vaults).
                 c_ = store.conn()
-                rows = c_.execute(
-                    "SELECT hash, data FROM chunks WHERE "
-                    "substr(hex(data),1,10)='5356454E01'").fetchall()
-                done = 0
-                for h, data in rows:
-                    plain = store._open(data, h)
-                    c_.execute("UPDATE chunks SET data=? WHERE hash=?",
-                               (plain, h))
-                    done += 1
-                    bar.done = done; bar.update(0)
-                    if done % 100 == 0:
+                cursor = done = 0
+                while True:
+                    rows = c_.execute(
+                        "SELECT rowid, hash, data FROM chunks "
+                        f"WHERE rowid > ? AND {pred} "
+                        "ORDER BY rowid LIMIT ?",
+                        (cursor, store.DB_BATCH)).fetchall()
+                    if not rows:
+                        break
+                    c_.execute("BEGIN TRANSACTION")
+                    try:
+                        for rowid, h, data in rows:
+                            c_.execute("UPDATE chunks SET data=? WHERE hash=?",
+                                       (store._open(data, h), h))
+                            cursor = rowid
+                            done += 1
                         c_.commit()
-                c_.commit()
-                store.disable_encryption(args.password)
+                    except Exception:
+                        c_.rollback()
+                        raise
+                    bar.done = done
+                    bar.update(0)
+                # Unseal the board *before* dropping the key, or every note
+                # becomes permanently "[unreadable — wrong key?]".
+                msg_n = store.migrate_messages(encrypt=False)
+                store.disable_encryption(pw)
             else:
-                store.migrate_encryption(progress=prog)
+                done = store.migrate_encryption(progress=prog)
+                msg_n = store.migrate_messages(encrypt=True)
+                n_all = done
             bar.finish()
             print(green(f"  ✓ vault {'encrypted' if args.encrypt else 'decrypted'}"
-                        f" · {n_all} chunk(s) rewritten"))
+                        f" · {n_all} chunk(s) · {msg_n} message(s) rewritten"))
             if not args.serve:
                 return EXIT_OK
             print(dim("  · serving with the new setting"))
-        except LockedVault as e:
+        except (LockedVault, ValueError, CryptoUnavailable) as e:
             print(red(f"  ✗ {e}"))
             return EXIT_NOMATCH
 
@@ -5807,7 +6059,7 @@ def main(argv=None):
     discovery = None
     if not args.no_discover and args.host != "127.0.0.1":
         name = os.path.basename(vault).replace(".vault", "")
-        discovery = DiscoveryResponder(name, port, store.has_password(),
+        discovery = DiscoveryResponder(name, port, store.auth_required(),
                                        files=store.stats()["files"])
         discovery.start()
     s = store.stats()

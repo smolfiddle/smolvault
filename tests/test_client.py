@@ -254,8 +254,9 @@ class TestAuthProbe(unittest.TestCase):
 
 
 class TestBoardQ(unittest.TestCase):
-    """#33: the docstring promised 'Esc/q exits'; on a TTY `q` was typed
-    into the buffer and posted to the permanent board instead."""
+    """#33: 'q' used to be swallowed as an exit key, so it could never be
+    typed into a message. Esc is the documented exit; every letter now
+    reaches the buffer."""
 
     def setUp(self):
         self.W = tempfile.mkdtemp(prefix="svboardq_")
@@ -265,7 +266,7 @@ class TestBoardQ(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.W, ignore_errors=True)
 
-    def test_q_exits_without_posting(self):
+    def test_q_is_typeable_and_esc_exits(self):
         keys = itertools.chain(["q"], itertools.repeat("\x1b"))
         buf = io.StringIO()
         with redirect_stdout(buf):
@@ -274,7 +275,8 @@ class TestBoardQ(unittest.TestCase):
         self.assertEqual(rc, sv.EXIT_OK)
         bodies = [m["body"] for m in self.store.msgs_since(0)]
         self.assertEqual(bodies, ["existing"],
-                         "'q' must exit, not post")
+                         "q alone is buffer text, not a post; Esc exits")
+        self.assertIn("q", buf.getvalue())
 
     def test_poll_failure_is_surfaced(self):
         calls = {"n": 0}

@@ -466,10 +466,13 @@ class TestHTTP(unittest.TestCase):
                             headers={"If-None-Match": f'w/"{etag}"'})
         self.assertEqual(st, 304, "W/ is case-insensitive per RFC 7232")
         self.assertEqual(d, b"")
-        st, _, _ = self.req("GET", "/weak.txt",
+        st, d, _ = self.req("GET", "/weak.txt",
                             headers={"Range": "bytes=0-1",
                                      "If-Range": f'w/"{etag}"'})
-        self.assertEqual(st, 206, "weak If-Range with a matching etag must 206")
+        # RFC 7233 §3.2: If-Range needs a strong validator; a weak one must
+        # be ignored, so the Range is dropped and the full body is served.
+        self.assertEqual(st, 200, "weak If-Range must be ignored")
+        self.assertEqual(d, b"body")
 
     def test_if_none_match_star(self):
         self.req("PUT", "/star.txt", body=b"xy", headers={"Content-Length": "2"})

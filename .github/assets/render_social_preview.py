@@ -48,7 +48,7 @@ def main():
     span(px + 40, ty, [("┌" + "─" * 56 + "┐", BORDER)])
     ty += 38
     span(px + 40, ty, [("│  ", BORDER), ("smolvault", BRIGHT),
-                       (" 0.2.1", DIM)])
+                       (" 0.4.2", DIM)])
     ty += 40
     rows = [
         [("│  ", BORDER), ("vault   ", DIM), ("vault.vault", FG),
